@@ -28,6 +28,8 @@
 #include <Client/CNetClient.hpp>
 #include <Misc/DataContainer.hpp>
 #include <algorithm>
+#include <cstdarg>
+#include <cstdio>
 #include <cstring>
 #include <ctime>
 #include <map>
@@ -84,6 +86,13 @@ namespace
         if (type != 3 && type != 4)
             return 0;
         return static_cast<uint8_t>(*reinterpret_cast<const uint32_t*>(*reinterpret_cast<uint8_t* const*>(unit + 8) + 0x5C) >> 8);
+    }
+
+    // UNIT_FIELD_LEVEL (descriptor +0xD8): the level an essence row - and therewith every budget,
+    // every remaining point and every gate - is read at.
+    uint32_t UnitLevel(const uint8_t* unit)
+    {
+        return *reinterpret_cast<const uint32_t*>(*reinterpret_cast<uint8_t* const*>(unit + 8) + 0xD8);
     }
 
     // ---- row predicates ---------------------------------------------------------------------------
@@ -597,6 +606,34 @@ namespace
     uint64_t g_pendingVersion = 0;       // DAT_10bde3d8
     uint64_t g_pendingSeen = 0;          // DAT_10bde430
     bool g_pendingSignal = false;        // DAT_10bde424
+
+    /* True from the moment the window's save hands the pending build to the realm until the realm
+     * answers it (0x726, or the 0x72C result for a refusal). Until then that build is the
+     * character's - the one being committed - and not a browse, whatever archetype it names. Without
+     * this, the window's own readers during the flight (the commit buttons, the chooser) take the
+     * build for a browse nobody is waiting on and drop it back to the old archetype, so the trees
+     * repoint to the old one and repoint again when the push lands: the "applying a change snaps
+     * through the old archetype" report. Set by `AscCACompat::ApplyPendingBuild`, which is where the
+     * save leaves the window. */
+    bool g_saveInFlight = false;
+    /* The switch price the realm quoted with the last preview it answered (its `SendPreviewState`),
+     * and the archetype it was quoted for. Which rows a departure bills is the realm's policy - it is
+     * the side that owns the archetype defaults - so the price of a switch is asked for rather than
+     * derived twice, and the dialog the window raises and the fee the realm takes are one number.
+     * Nonzero only while a browse is staged: `ResetPendingBuild` drops it with the staging that asked
+     * for it, so it can never be spent on a build the realm did not price. */
+    uint32_t g_quoteSpec = 0, g_quoteMarks = 0, g_quoteCopper = 0;
+    /* A spec and its build are one state, and the realm pushes them as two packets in step (0x725,
+     * then the 0x726 that writes the build). Every read of the active spec answers from its build -
+     * a node's rank is `ActiveBuild()->RankOf` - so a spec without its build is rank 0 everywhere:
+     * the invested class-tree talents grey for as long as the two packets are apart, then come back
+     * (the "left tree flickers grey as it saves" report). The spec is held here until its build
+     * exists and applied by OnKnownEntries before it writes it, so the active spec never names an
+     * absent build. The announcement goes out with the write, so the window still redraws once, on
+     * real data. */
+    bool g_specHeld = false;
+    uint32_t g_heldSpec = 0, g_heldCount = 0;
+    bool g_specSignalDeferred = false;
     time_t g_lastUpdate = 0;             // DAT_10bde428
     std::map<uint8_t, uint32_t> g_credits;   // 0x10bded78 (FUN_101a1c90), category -> amount
 
@@ -1002,12 +1039,222 @@ Build* ActiveBuild()
     if (Player* p = FindPlayer(guid))
         if (Build* b = p->Get(p->spec))
             return b;
+    // Every read of the window's state - a node's rank (`PushTalentRank`), whether a row is known
+    // (`IsKnownID`), the prices - answers from this build. The spec's own build is absent only
+    // between the spec and its build (0x725, then 0x726), and only on an archetype's first visit:
+    // a visited one keeps its build cached. Answering the *empty* default there is what greys every
+    // node for as long as the two packets are apart - the "first switch per archetype flickers grey"
+    // report. The staged build is the one the window is drawing and the one being committed, so it
+    // is the honest answer for that window.
+    if (g_mgr.pending)
+        return g_mgr.pending;
     return DefaultBuild();
 }
 
 Build* PendingBuild() { return g_mgr.pending; }
 
 void RequestAutoLearn() { g_mgr.autoLearn = true; }
+
+    /* The pass every pending-build edit asks for (`Build::Add`/`SetRank`/`Remove` call
+     * `RequestAutoLearn`): every free 0x100000 row the pending build can take, one rank at a
+     * time. It is the client's own rule for the rows the window draws at rank 1 without the
+     * player buying anything - an archetype's passives - and it is what the manager's tick runs
+     * once the flag is up. Returns true when it added anything. Run here rather than only on the
+     * tick so a staged archetype comes up complete in the same frame it is staged, instead of
+     * growing its passives a second later.
+     *
+     * Swept to a fixpoint, because the rows it takes are a *chain*: an archetype's level passives
+     * gate on each other (9311 at 20, then 4715 at 30, 4733 at 40 and 13133 at 50, each requiring
+     * the one before it through the connected-entry rule), and a row whose prerequisite sorts
+     * *after* it in entry-id order - 4715 before 9311 - is refused on the sweep that reaches it and
+     * can only be taken by a later one. One sweep therefore learned the level-20 node alone and
+     * left the rest to whatever happened to run the pass again, which on a staged preview was the
+     * manager's next tick, whose result nothing announced: the engine held the archetype's passives
+     * while the window went on drawing the build it had, and they appeared only once a state push
+     * (a save, a relog) replaced it. Each sweep adds at least one rank and ranks only grow, so the
+     * fixpoint is reached, in one call, in at most as many sweeps as the chain has links. */
+    bool RunAutoLearnPass()
+    {
+        g_mgr.autoLearn = false;
+        Build* p = g_mgr.pending;
+        if (!p)
+            return false;
+        bool learned = false;
+        // The held-rank total is what decides whether a sweep progressed, not "did it add one":
+        // taking a group-1 row evicts the build's other group-1 rows on the way in (`Build::AddEntry`),
+        // so a sweep can add a rank and drop one, and a pair like that would otherwise keep the
+        // sweeps going round for ever. The total only grows, is bounded by the candidate rows' max
+        // ranks, and every real sweep of a chain raises it (see above).
+        auto ranksHeld = [p]() {
+            size_t total = 0;
+            for (const Entry& e : p->entries)
+                total += e.rank;
+            return total;
+        };
+        for (size_t held = ranksHeld();;)
+        {
+            ForEachRow([&](Row r) {
+                if (!RowHasFlag(r, 0x100000))
+                    return;
+                const uint32_t id = RowU32(r, 0);
+                while (p->AECost(r, 1) == 0 && p->TECost(r, 1) == 0 && p->ValidateLearn(nullptr, id, {}, {}) == 0)
+                {
+                    p->AddRank(id);
+                    learned = true;
+                }
+            });
+            if (size_t const now = ranksHeld(); now > held)
+                held = now;
+            else
+                break;
+        }
+        // `AddRank` re-raises the flag the whole way down, and the sweeps above have now taken
+        // everything it was asking for: leaving it up would ask the tick for a sweep that can only
+        // find nothing.
+        g_mgr.autoLearn = false;
+        if (learned)
+        {
+            // The engine's own convention after a pending-build write (`AddRanks`, `ResetPendingBuild`,
+            // the staged preview): leave the entries in the order the rules accept. This pass appends
+            // in table order, which is not dependency order - 4715 is written ahead of 9311, the row
+            // it needs - and the in-order validation behind Save Changes and its cost popup reads the
+            // entries in the order they are stored.
+            p->Reorder(false);
+            // The version moves for the ranks gained, so the pass's own work is announced (see Update).
+            BumpPendingVersion();
+        }
+        return learned;
+    }
+
+    // The pending-build change the window's trees listen for, run where the change actually
+    // happened instead of waiting for the manager's next tick. `Update()` fires the same signal
+    // once a second, so a state push or a staged preview left both trees drawing the build they
+    // had before it until that tick came round - the "the nodes show up a moment later" report.
+    // The work is the tick's own: the entry counts on both builds and the recent-set rebuild,
+    // then the signal, deferred only if a learn/unlearn request is still in flight (the tick
+    // would otherwise deliver it mid-request, which is what `g_pendingSignal` is for).
+    //
+    // `immediate` is for a build that is complete the moment it is written - a staged archetype's
+    // defaults, or the pending build coming back to the character's own. There the request gate
+    // protects nothing and only costs the window a second of drawing the build it just replaced,
+    // so the signal goes out now; the tick keeps waiting, because there the build is mid-change.
+    // Set by the glue's install, once the Lua helper the tree mark calls exists.
+    bool g_windowTrees = false;
+
+    namespace
+    {
+        // Defined with `SpecOf` below, which it needs: marks the window's two trees for the build the
+        // pending one now holds. A whole build written at once is announced to the window, and an
+        // announcement cannot reach a tree that is hidden at the time - this is the half that can. See
+        // the definition.
+        void MarkWindowTreesFromPending();
+        // Defined with `MarkWindowTrees` below: installs the window's own ends of a browse (see
+        // AscCACoAGlue). Called from the staging that starts one, which is the moment the window is
+        // certain to exist - the glue's events have both passed by the time the realm installs.
+        void EnsureBrowseEnds();
+        // Defined with `ParamsFromUnit` below, which it needs: completes a build a state push wrote
+        // with the parameters the unit implies, so nothing visible waits for the manager's tick.
+        bool CompleteBuildFromUnit(Build& b);
+    }
+
+    /* The browse/preview diagnostic, on only when the client was asked for it: `COA_COMPAT_TRACE=1`
+     * in its environment. It writes Logs\CoACompatBrowse.log without the `-extlog` switch, so the
+     * ordering of a staged preview against the reads the window makes of it can be read straight off
+     * disk whatever a client was launched with - and it writes a line per read the window makes while
+     * drawing (`GetActiveChrSpec`, `CanApplyPendingBuild`), which is why it is off unless asked for: a
+     * file write and a flush inside a UI read path is not something a player should pay for the
+     * diagnostic of. The call sites stay where they are; the switch is what makes them free. */
+    bool CoATraceEnabled()
+    {
+        static bool const enabled = []
+        {
+            char value[8] = {};
+            return GetEnvironmentVariableA("COA_COMPAT_TRACE", value, sizeof(value)) != 0 &&
+                value[0] != '\0' && value[0] != '0';
+        }();
+        return enabled;
+    }
+
+    void CoADbg(const char* fmt, ...)
+    {
+        if (!CoATraceEnabled())
+            return;
+        static bool opened = false;
+        static FILE* file = nullptr;
+        if (!opened)
+        {
+            opened = true;
+            CreateDirectoryA("Logs", nullptr);
+            file = fopen("Logs\\CoACompatBrowse.log", "a");
+            if (file)
+                fputs("---- session ----\n", file);
+        }
+        if (!file)
+            return;
+        va_list ap;
+        va_start(ap, fmt);
+        vfprintf(file, fmt, ap);
+        va_end(ap);
+        fputc('\n', file);
+        fflush(file);
+    }
+
+    /* "id:rank,..." for a build's entries - the one place every rank the window draws is read from.
+     * Empty while the trace is off, because this is only ever an argument to a line that is not going
+     * to be written: walking and formatting every rank of a build for a discarded line is the cost the
+     * switch above exists to avoid, and the argument is evaluated before the call that would drop it. */
+    std::string CoADbgEntries(const Build* b)
+    {
+        if (!CoATraceEnabled())
+            return {};
+        if (!b)
+            return "<none>";
+        std::string out;
+        char one[32];
+        for (const Entry& e : b->entries)
+        {
+            _snprintf(one, sizeof(one), "%s%u:%u", out.empty() ? "" : ",", e.id, e.rank);
+            out += one;
+        }
+        return out.empty() ? "<empty>" : out;
+    }
+
+    void FlushPendingBuildSignal(bool immediate = false)
+    {
+        if (!g_mgr.pending || g_pendingVersion == g_pendingSeen)
+            return;
+        g_pendingSeen = g_pendingVersion;
+        auto count = [](Build* b) {
+            b->u44 = 0;
+            b->u48 = 0;
+            for (const Entry& e : b->entries)
+                if (Row r = FindRow(e.id))
+                {
+                    const int type = RowType(r);
+                    if (type == 1 || type == 4)
+                        ++b->u44;
+                    else if (type == 2)
+                        ++b->u48;
+                }
+        };
+        if (Build* active = ActiveBuild())
+            count(active);
+        count(g_mgr.pending);
+        AscCAFilter::RebuildRecentSets();   // FUN_101ca1d0, FUN_101c4360, FUN_101ca500 on mgr +0x190
+        if (immediate || g_requests.empty())
+        {
+            g_pendingSignal = false;
+            CoADbg("signal immediate=%d pendingRows=%u [%s]", immediate ? 1 : 0,
+                   unsigned(g_mgr.pending->entries.size()), CoADbgEntries(g_mgr.pending).c_str());
+            // The trees the announcement may not reach, marked where they are - and before it goes
+            // out, so the spec the window is drawing is still the one the mark is compared against.
+            if (immediate)
+                MarkWindowTreesFromPending();
+            AscRuntime::Signal("CHARACTER_ADVANCEMENT_PENDING_BUILD_UPDATED");
+        }
+        else
+            g_pendingSignal = true;
+    }
 
 uint64_t BumpPendingVersion() { return ++g_pendingVersion; }
 
@@ -1020,6 +1267,9 @@ void ResetPendingBuild()
     next->Reorder(false);   // FUN_101557d0(0)
     next->pendingHooks = true;   // lambdas 1..4 (FUN_10157fb0 / 10157e60 / 10157f40 / 10157ed0)
     ++g_pendingVersion;
+    // The staging that asked for a price is gone, so the price goes with it: a quote is only ever
+    // spent on the browse it was quoted for (see CanApplyPendingBuild).
+    g_quoteSpec = g_quoteMarks = g_quoteCopper = 0;
 }
 
 namespace
@@ -1046,8 +1296,24 @@ namespace
         const uint32_t spec = Read<uint32_t>(p);
         const uint32_t count = Read<uint32_t>(p);
         const uint32_t old = g_mgr.player->spec;
+        if (!g_mgr.player->Get(spec))
+        {
+            // Held, not applied: the build for it rides the 0x726 (see g_specHeld). Nothing is
+            // announced either - the window redraws on that announcement, and a redraw now would
+            // read rank 0 for every node. OnKnownEntries applies it as it writes the build.
+            g_specHeld = true;
+            g_heldSpec = spec;
+            g_heldCount = count;
+            g_specSignalDeferred = true;
+            AscLog::Printf("CoACompat: active spec %u -> %u held for its build (0x726)", old, spec);
+            return;
+        }
         g_mgr.player->spec = spec;
         g_mgr.player->count = count;
+        // Reached only with the build in hand (the absent case returns above): the spec, the build it
+        // names and the announcement are one transition, so no reader - and no redraw - can land
+        // between them. Logged so a report of a flicker has a timeline.
+        AscLog::Printf("CoACompat: active spec %u -> %u (%u specs), build present", old, spec, count);
         if (old != spec)
             Fire(g_onSpecChanged, old & 0xFF, spec & 0xFF);
         AscRuntime::Signal("ASCENSION_CA_SPECIALIZATION_ACTIVE_ID_CHANGED", "%u", spec + 1);
@@ -1059,11 +1325,13 @@ namespace
         if (!g_mgr.player)
             return;
         if (Build* b = g_mgr.player->Get(g_mgr.player->spec))
+        {
             for (uint8_t c = 1; c <= 4; ++c)
             {
                 auto it = g_credits.find(c);
                 b->credit[c - 1] = it == g_credits.end() ? 0 : it->second;
             }
+        }
     }
 
     // FUN_101a1b70 (every glue screen): the credit map emptied (FUN_101a1c90 -> FUN_101092d0).
@@ -1084,6 +1352,17 @@ namespace
         {
             EnsurePlayer();
             created = true;
+        }
+        // The spec 0x725 held back, applied here and not before: the build it names is written into
+        // it below, so this is the moment both halves of the transition exist together (g_specHeld).
+        if (g_specHeld)
+        {
+            g_specHeld = false;
+            const uint32_t previous = g_mgr.player->spec;
+            g_mgr.player->spec = g_heldSpec;
+            g_mgr.player->count = g_heldCount;
+            if (previous != g_heldSpec)
+                Fire(g_onSpecChanged, previous & 0xFF, g_heldSpec & 0xFF);
         }
         if (!g_mgr.player->Get(g_mgr.player->spec))
         {
@@ -1145,6 +1424,11 @@ namespace
 
         build->entries = fresh;   // FUN_10158010 + FUN_10158e40(0)
         build->UpdatePointers(false);
+        // The build is written complete: the parameters its budget, its point totals and every gate
+        // that reads one are computed from are filled here, where the realm's build lands, instead of
+        // being left to the manager's tick (see CompleteBuildFromUnit). On an archetype's first
+        // switch this is what kept the window's counters at a grey 0/0 until the tick ran.
+        CompleteBuildFromUnit(*build);
 
         for (auto& c : changed)
             AscRuntime::Signal("ASCENSION_KNOWN_ENTRY_UPDATED", "%u%u", c.first, c.second);
@@ -1163,6 +1447,20 @@ namespace
 
         RefreshCredits();
         ResetPendingBuild();
+        g_saveInFlight = false;   // the save, if this answered one, has landed
+        AscLog::Printf("CoACompat: state push for spec %u, %u entries, active build %s", g_mgr.player->spec,
+                       static_cast<unsigned>(fresh.size()),
+                       g_mgr.player->Get(g_mgr.player->spec) ? "present" : "absent");
+        // The spec change this push answers, announced now that the build it names is written (see
+        // OnActiveSpec). Ahead of the flush, so the window has repointed before the trees are marked.
+        if (g_specSignalDeferred)
+        {
+            g_specSignalDeferred = false;
+            AscRuntime::Signal("ASCENSION_CA_SPECIALIZATION_ACTIVE_ID_CHANGED", "%u", g_mgr.player->spec + 1);
+        }
+        // Handed over whole, so it is announced the moment it is written: the window draws the
+        // realm's build instead of the one it is holding, without waiting for the tick.
+        FlushPendingBuildSignal(true);
     }
 
     // FUN_10170360 / FUN_10170b50 / FUN_10170750: a result name, looked up in its enum only to decide
@@ -1173,6 +1471,104 @@ namespace
             if (s == names[i])
                 return i;
         return 1;
+    }
+
+    // CoA staged preview (SMSG 0x7B4, our realm's own opcode): the archetype's
+    // authoritative defaults, applied to the *pending* build. SMSG 0x726 cannot do this -
+    // its handler writes the active build and resets pending, so a preview sent that way
+    // becomes the character's own build and Save Changes has nothing to commit. The realm
+    // untouched means the true active build never changes here; the pending build simply
+    // starts holding the previewed archetype's baseline, and the player builds on from it
+    // exactly as the shipped window expects. specId 0 means the archetype asked for is the
+    // character's own: the pending build returns to it.
+    void __cdecl OnPreviewState(void*, uint32_t, uint32_t, CDataStore* p)
+    {
+        if (!g_mgr.player)
+            EnsurePlayer();
+        if (!g_mgr.player->Get(g_mgr.player->spec))
+            g_mgr.player->Ensure(g_mgr.player->spec);
+        Build* active = g_mgr.player->Get(g_mgr.player->spec);
+        if (!active)
+            return;
+
+        const uint32_t n = Read<uint32_t>(p);
+        std::vector<Entry> fresh;
+        fresh.reserve(n);
+        for (uint32_t i = 0; i < n; ++i)
+        {
+            Entry e;
+            e.id = Read<uint32_t>(p);
+            e.rank = Read<uint32_t>(p);
+            e.u0c = Read<uint32_t>(p);
+            e.locked = Read<uint8_t>(p);
+            e.u18 = Read<uint32_t>(p);
+            e.u1c = Read<uint32_t>(p);
+            fresh.push_back(e);
+        }
+        const uint32_t specId = Read<uint32_t>(p);
+        const uint32_t aeCredit = Read<uint32_t>(p);
+        const uint32_t teCredit = Read<uint32_t>(p);
+        // The realm's own price for the switch this preview offers (see `g_quoteSpec`). A realm that
+        // sends none leaves the price to the window's own computation. Stored after the staging below,
+        // which resets the quote along with the build it belonged to.
+        uint32_t quoteMarks = 0, quoteCopper = 0;
+        if (p->m_size - p->m_read >= 8)
+        {
+            quoteMarks = Read<uint32_t>(p);
+            quoteCopper = Read<uint32_t>(p);
+        }
+
+        if (!specId)
+        {
+            // The archetype asked for is the character's own: the pending build returns to it, and
+            // the window is told in the same breath, so the trees move back onto the character's
+            // archetype now instead of on the manager's next tick.
+            CoADbg("stage spec=0 -> own: pending reset to the character's build");
+            ResetPendingBuild();
+            FlushPendingBuildSignal(true);
+            return;
+        }
+
+        ResetPendingBuild();
+        AscLog::Printf("CoACompat: staged preview of spec %u, %u entries, credit %u|%u", specId,
+                       static_cast<unsigned>(fresh.size()), aeCredit, teCredit);
+        if (Build* b = g_mgr.pending)
+        {
+            b->entries = fresh;
+            b->UpdatePointers(false);
+            b->Reorder(false);
+            // The previewed archetype's own credit is the realm's, and the staged build never
+            // takes away the credit the player already holds: the credit is what the realm says
+            // the character has, so the staging raises it to what the previewed baseline needs
+            // and never lowers it below what is already there.
+            b->credit[0] = std::max(b->credit[0], aeCredit);
+            b->credit[1] = std::max(b->credit[1], teCredit);
+            // Staging writes the rows directly, which skips the hook an edit goes through, so the
+            // client's own auto-learn pass is run here instead of waiting for the tick to find a
+            // flag nobody set. The realm's baseline is the same set, so this is normally silent;
+            // when the two disagree, the client's own rule wins for its own build and the save
+            // that follows carries the rows it drew.
+            RunAutoLearnPass();
+            CoADbg("stage spec=%u realmSent=%u afterAutoLearnRows=%u quote=%u/%u [%s]", specId,
+                   unsigned(fresh.size()), unsigned(b->entries.size()), quoteMarks, quoteCopper,
+                   CoADbgEntries(b).c_str());
+            g_quoteSpec = specId;
+            g_quoteMarks = quoteMarks;
+            g_quoteCopper = quoteCopper;
+            BumpPendingVersion();
+            // The browse starts here, so its ends have to exist from here: see `EnsureBrowseEnds`.
+            EnsureBrowseEnds();
+        }
+        // One signal, not two. The window moves onto the previewed archetype off the pending-build
+        // event: `CoATalentFrameMixin` spends its `expectingNewSpec` flag on it, repoints the two
+        // trees at `GetActiveChrSpec` (the staged build), redraws every node from the ranks it
+        // holds and refreshes the commit buttons and the point counters. A second, spec-changed
+        // signal only buys a second `UpdateActiveSpec` - and by then the trees are shown, so that
+        // pass marks the *previous* archetype's nodes dirty and the player watches them repaint
+        // before the rebuild replaces them. The character's archetype has not changed either: only
+        // a save changes that, which is what `OnActiveSpec` (0x725) announces. `true`: the staged
+        // build is complete state, so it is announced now rather than behind an apply in flight.
+        FlushPendingBuildSignal(true);
     }
 
     void __cdecl OnLearnResult(void*, uint32_t, uint32_t, CDataStore* p)   // 0x728
@@ -1218,7 +1614,7 @@ namespace
         out.coa = cls >= 12 && cls <= 32;
         out.stock = StockClass(cls);
         out.u2c = AscObjectAddon::Unit(ActivePlayerGuid())[2].value;   // FUN_102d9f00
-        out.level = *reinterpret_cast<const uint32_t*>(desc + 0xD8);
+        out.level = UnitLevel(unit);
         out.name.clear();
         out.u64 = out.u65 = 0;
     }
@@ -1252,11 +1648,68 @@ namespace
         return changed;
     }
 
+    /* FUN_1014e4d0 + FUN_10158810, run where a build is *written* and not only on the manager's tick.
+     * Every number a build reports is computed from its parameters - its class and level (the essence
+     * row that holds the level's budget), the mode flags that pick a cost column, `u2c` - and a build
+     * the manager had not seen yet carried none of them: the state push creates it, writes its entries
+     * and leaves `classKey`/`level` at 0 until the tick repairs them, up to a second later. In that
+     * second the build's budget, its remaining points and every gate that reads one answered zero, and
+     * the window - whose point counters read the pending copy of that build - drew them grey 0/0 on
+     * the first switch into each archetype, recovering when the tick caught up. Completing the build
+     * where it is written makes the written state whole, so nothing the player sees depends on when
+     * the tick happens to run. True when anything differed. */
+    bool CompleteBuildFromUnit(Build& b)
+    {
+        const uint8_t* unit = ActivePlayer();
+        if (!unit)
+            return false;
+        Build params;
+        ParamsFromUnit(params, unit, ActiveSpecIndex());
+        if (!SyncParams(b, params))
+            return false;
+        b.Prepare();   // FUN_10157450, as the tick's own path does
+        return true;
+    }
+
+    /* The one parameter the unit moves while the window is open, watched per frame instead of once a
+     * second. Every point total, gate and rule is read at the build's own level, and the build
+     * followed the unit only inside the throttled sync below - so a window opened in the second after
+     * a level-up still answered with the previous level's essence row: the points stayed at the value
+     * the player had a moment ago until something repainted them ("level up, press N, the points are
+     * the old ones"). The check is one descriptor read; the sync runs the moment the level differs,
+     * the staged build comes with it, and the window is told in the same breath - what it holds is
+     * complete state, so the announcement is immediate. True when the level moved. */
+    bool FollowLevelChange(const uint8_t* unit)
+    {
+        if (!g_mgr.player || !unit)
+            return false;
+        Build* b = g_mgr.player->Get(g_mgr.player->spec);
+        if (!b || b->level == UnitLevel(unit))
+            return false;
+        if (!CompleteBuildFromUnit(*b))
+            return false;
+        if (g_mgr.pending)
+        {
+            g_mgr.pending->level = b->level;
+            g_mgr.pending->u2c = b->u2c;
+        }
+        BumpPendingVersion();
+        FlushPendingBuildSignal(true);
+        // The throttled sync below is where a level change used to be noticed, and it announced it a
+        // second time (CHARACTER_ADVANCEMENT_BUILD_LEVEL_UPDATED, which the classic window's currency
+        // bars follow). Syncing here first would leave that sync seeing no change and silence it, so
+        // the announcement is made here, where the change is actually seen.
+        AscRuntime::Signal("CHARACTER_ADVANCEMENT_BUILD_LEVEL_UPDATED");
+        return true;
+    }
+
     void Update()
     {
         bool resetPending = false, levelUpdated = false;
         const time_t now = time(nullptr);
         const uint8_t* unit = ActivePlayer();
+        // A level-up is the one change that must not wait for the tick below (see FollowLevelChange).
+        FollowLevelChange(unit);
         if (now != g_lastUpdate && unit)
         {
             g_lastUpdate = now;
@@ -1288,24 +1741,15 @@ namespace
                 }
             }
         }
-        bool autoLearned = false;
+        // A pass that learned something must be announced here like any other change: the flag it
+        // was asked for is cleared by the pass itself now that a call reaches its fixpoint, so this
+        // block is the only place left that can tell the window about the rows it took. It used to
+        // be skipped for exactly that case (`!autoLearned`), and the rows the pass had just gained -
+        // an archetype's level passives, one chain link per sweep - then stayed in the engine while
+        // the window kept drawing the build it already had.
         if (!resetPending && g_mgr.autoLearn)
-        {
-            // Every free 0x100000 row the pending build can take, one rank at a time.
-            g_mgr.autoLearn = false;
-            if (Build* p = g_mgr.pending)
-                ForEachRow([&](Row r) {
-                    if (!RowHasFlag(r, 0x100000))
-                        return;
-                    const uint32_t id = RowU32(r, 0);
-                    while (p->AECost(r, 1) == 0 && p->TECost(r, 1) == 0 && p->ValidateLearn(nullptr, id, {}, {}) == 0)
-                    {
-                        p->AddRank(id);
-                        autoLearned = true;
-                    }
-                });
-        }
-        if (!resetPending && !autoLearned && g_pendingVersion != g_pendingSeen && g_mgr.pending)
+            RunAutoLearnPass();
+        if (!resetPending && g_pendingVersion != g_pendingSeen && g_mgr.pending)
         {
             g_pendingSeen = g_pendingVersion;
             // Update(void)::`48'::<lambda_1> (FUN_10183220), on the active build then the pending one:
@@ -2228,9 +2672,7 @@ namespace
             return 0;
         PushInt(L, static_cast<int32_t>(b->GlobalTE(0)));
         return 1;
-    }
-
-    int GetPendingRemainingAE(lua_State* L)
+    }    int GetPendingRemainingAE(lua_State* L)
     {
         Build* b = PendingOrError(L, "GetPendingRemainingAE");
         if (!b)
@@ -2238,7 +2680,6 @@ namespace
         PushInt(L, static_cast<int32_t>(b->RemainingAE()));
         return 1;
     }
-
     int GetPendingRemainingTE(lua_State* L)
     {
         Build* b = PendingOrError(L, "GetPendingRemainingTE");
@@ -2460,6 +2901,17 @@ namespace
         for (const Entry& e : snapshot)
             if (RowU32(e.row, 0x74) != 1 && (!forReset || !RowHasFlag(e.row, 2)))
                 b->Remove(e.id);
+        // A reset is not an unlearn: it puts the build back to what the archetype grants, and the
+        // rows the client's own rule hands out at this level - the free 0x100000 passives, which no
+        // flag keeps through the clear - are part of that state. `Build::Remove` deliberately does
+        // not ask the pass for a row it removed (that is what keeps an unlearn a choice the player
+        // made), so the reset has to ask here. Without it the passives sit at 0/1: the window draws
+        // them as learnable, they can be clicked as if they were still to be bought, and the save
+        // that follows bills their removal as an unlearn the player never asked for.
+        if (forReset)
+            RunAutoLearnPass();
+        CoADbg("clear forReset=%d pending=%u [%s]", forReset ? 1 : 0, unsigned(b->entries.size()),
+               CoADbgEntries(b).c_str());
         BumpPendingVersion();
         return 0;
     }
@@ -2477,6 +2929,12 @@ namespace
         for (const Entry& e : snapshot)
             if (RowU32(e.row, 0x80) == cls && RowU32(e.row, 0x84) == tab && (!forReset || !RowHasFlag(e.row, 2)))
                 b->Remove(e.id);
+        // A tree reset is a reset, not an unlearn: the rows the client's own rule grants at this
+        // level come back with it. See `ClearPendingBuild` for why the pass has to be asked here.
+        if (forReset)
+            RunAutoLearnPass();
+        CoADbg("clearTab cls=%u tab=%u forReset=%d pending=%u [%s]", cls, tab, forReset ? 1 : 0,
+               unsigned(b->entries.size()), CoADbgEntries(b).c_str());
         BumpPendingVersion();
         return 0;
     }
@@ -2841,6 +3299,10 @@ namespace
         }
     }
 
+    // The coinage reader is defined with the CA cost helpers it belongs to, far below; the quote's
+    // affordability check in `CanApplyPendingBuild` is the first call this far up the file.
+    uint32_t Coinage(const uint8_t* unit);
+
     int CanApplyPendingBuild(lua_State* L)
     {
         Build* b = PendingOrError(L, "CanApplyPendingBuild");
@@ -2848,9 +3310,56 @@ namespace
             return 0;
         uint32_t lr, id, rank;
         ApplyCosts costs;
-        const uint32_t result = ValidateApply(ActivePlayer(), *ActiveBuild(), b->entries, lr, id, rank, costs);
+        uint32_t result = ValidateApply(ActivePlayer(), *ActiveBuild(), b->entries, lr, id, rank, costs);
+        /* A switch to another archetype is priced by the realm, whose quote arrived with the preview
+         * that staged it (see `g_quoteSpec`): the confirmation the player accepts and the fee the
+         * realm takes are one number, whatever the realm's policy is. Ranks inside the archetype's own
+         * tree and a reset are priced here, and the realm prices those with the same rule. */
+        if (g_quoteSpec)
+        {
+            costs.marks = g_quoteMarks;
+            costs.money = g_quoteCopper;
+            costs.tokens.clear();
+            /* A price the window can see is a price the window can refuse: the realm would refuse the
+             * same switch, so it is refused here rather than offered and then rejected. The quote is
+             * the realm's own bill, so covering both of its amounts is exactly what the realm asks;
+             * CA_UPDATE_ENTRIES_MISSING_TOKENS is the code the window's own cost check answers with. */
+            const uint8_t* unit = static_cast<const uint8_t*>(ActivePlayer());
+            if (result == 0 && ((costs.marks && UnitItemCount(unit, kMarkOfAscensionItem) < costs.marks) ||
+                                (costs.money && Coinage(unit) < costs.money)))
+                result = 7;
+            CoADbg("quote applied on the switch to %u: marks=%u money=%u result=%u", g_quoteSpec,
+                   costs.marks, costs.money, result);
+        }
         PushApplyResult(L, result, lr, id, rank);
         PushCosts(L, costs);
+        // TEMPORARY, part of the browse/preview diagnostic: the verdict and the bill the Save button,
+        // the cost popup and `CONFIRM_RESET_BUILD` are all drawn from this call, so it is logged (only
+        // when something about it changes, to keep a session's log readable).
+        {
+            static uint32_t lastResult = 0xFFFFFFFFu, lastLearn = 0xFFFFFFFFu, lastMarks = 0xFFFFFFFFu;
+            static uint32_t lastMoney = 0xFFFFFFFFu, lastTokens = 0xFFFFFFFFu;
+            static size_t lastPending = size_t(-1), lastActive = size_t(-1);
+            const size_t pendingRows = b->entries.size();
+            const Build* active = ActiveBuild();
+            const size_t activeRows = active ? active->entries.size() : 0;
+            if (result != lastResult || lr != lastLearn || costs.marks != lastMarks || costs.money != lastMoney ||
+                costs.tokens.size() != lastTokens || pendingRows != lastPending || activeRows != lastActive)
+            {
+                lastResult = result; lastLearn = lr; lastMarks = costs.marks;
+                lastMoney = costs.money; lastTokens = uint32_t(costs.tokens.size());
+                lastPending = pendingRows; lastActive = activeRows;
+                CoADbg("canApply result=%u reason=%s learnResult=%s entry=%u rank=%u marks=%u money=%u tokens=%u "
+                       "pending=%u active=%u",
+                       result, result ? UpdateName(result).c_str() : "ok",
+                       lr ? LearnName(lr).c_str() : "ok", id, rank, costs.marks, costs.money,
+                       unsigned(costs.tokens.size()), unsigned(pendingRows), unsigned(activeRows));
+                // TEMPORARY, same diagnostic: a refusal names the row it stopped on, and the build
+                // it stopped on is what says whether the window is holding something it should not.
+                if (result)
+                    CoADbg("canApply refused on [%s]", CoADbgEntries(b).c_str());
+            }
+        }
         return 8;
     }
 
@@ -2885,6 +3394,8 @@ namespace
         ApplyCosts costs;
         if (ValidateApply(ActivePlayer(), *ActiveBuild(), b->entries, lr, id, rank, costs) != 0)
             return Usage(L, "ApplyPendingBuild: pending build cannot be applied");
+        CoADbg("apply pending=%u marks=%u money=%u tokens=%u [%s]", unsigned(b->entries.size()), costs.marks,
+               costs.money, unsigned(costs.tokens.size()), CoADbgEntries(b).c_str());
         Packet pk(0x727);
         pk.U32(static_cast<uint32_t>(b->entries.size()));
         for (const Entry& e : b->entries)
@@ -4152,6 +4663,69 @@ namespace
         return 0;
     }
 
+    /* Tell the window's two trees which build they must draw - the one the pending build now holds.
+     * A whole build written at once (a staged archetype, a state push, a reset) is announced to the
+     * window as well, and an announcement alone is not enough: the trees subscribe to
+     * `CHARACTER_ADVANCEMENT_PENDING_BUILD_UPDATED` in their OnShow and unsubscribe in OnHide
+     * (`TalentTreeBaseMixin`), so a tree that is hidden while the build is written never hears it and
+     * goes on drawing the ranks of the visit before - the "the left tree shows the other archetype's
+     * talents, and shows nothing after switching back" report. A mark is not an announcement: the
+     * client's own `MarkDirty` is a flag on the tree that survives being hidden (its OnUpdate is only
+     * spent on the first frame the tree is visible again), so it lands whatever the window is showing
+     * at the time, and it costs the tree exactly the pass it needs.
+     *
+     * The class tree always takes `Nodes`: its tab is the class, fixed for the window's whole life
+     * (`CoATreeViewMixin:OnLoad`), so a new build changes only the ranks it draws. The spec tree takes
+     * `Nodes` only while it already draws this spec; otherwise the helper repoints it
+     * (`CoATreeViewMixin:SetSpecID` -> `SetClassTab` -> `RebuildTree`), because `SetSpecID` is the only
+     * call that repoints it at all and the window does not always make it - `ShowTreeView`, the path a
+     * click on the character's own card takes, shows the trees without repointing them, so a window
+     * whose spec and whose build disagree would draw the previous archetype's tree from then on. Two
+     * dirty reasons on one tree would cost two frames (`TalentTreeBaseMixin:Update` spends one per
+     * frame): it would repaint the previous archetype's nodes against the new build and only rebuild
+     * them on the following frame, which is the nodes visibly repopulating. Mark or repoint, exactly
+     * one reason each, whatever the window is doing.
+     *
+     * Called before the announcement, so `view.specID` still names the spec the window is drawing:
+     * that is what decides mark against repoint. The trees live in Lua, so it is asked of the client's
+     * own Lua - the helper the glue installs, which does nothing when the window was never built
+     * (there are no nodes to be stale then). */
+    void MarkWindowTrees(uint32_t specId)
+    {
+        if (!g_windowTrees)
+            return;
+        const std::string code = "CoACompatMarkTrees(" + std::to_string(specId) + ")";
+        // FrameScript_Execute 0x819210 - the same bridge the glue and AscRealmData::RunLua use.
+        reinterpret_cast<void(__cdecl*)(const char*, int, int)>(0x819210)(code.c_str(), 0, 0);
+    }
+
+    void MarkWindowTreesFromPending()
+    {
+        if (!g_windowTrees || !g_mgr.pending)
+            return;
+        MarkWindowTrees(SpecOf(*g_mgr.pending));
+    }
+
+    /* The two ends of a browse the window drives - its close, and the archetype chooser being shown -
+     * are installed by the glue, on the window's own frames. Installing them from the glue's events
+     * alone is not enough: the frames are built by the archetype addon, and by the time the realm
+     * installs its glue both `ADDON_LOADED` and `PLAYER_ENTERING_WORLD` have already fired, so a
+     * session that installs before the window exists keeps the hooks uninstalled for good - closing
+     * the window then ends nothing, and the browsed archetype goes on being answered as the window's
+     * identity (its tab, its trees, its card marked active) until something else ends the browse.
+     *
+     * The staging that starts a browse is the one moment the window is certain to exist - the player
+     * has just clicked a card in it - so the hooks are installed here as well, before the signal that
+     * makes the window draw the browse. The installer is idempotent, and a no-op until the window
+     * exists, so calling it on every staging is free. */
+    void EnsureBrowseEnds()
+    {
+        if (!g_windowTrees)
+            return;
+        reinterpret_cast<void(__cdecl*)(const char*, int, int)>(0x819210)(
+            "if CoACompatInstallBrowseEnds then CoACompatInstallBrowseEnds() end", 0, 0);
+    }
+
     // FUN_10182500: leave `spec` -- drop every entry outside choice group 1 except the spec-neutral ones
     // (+0x84 == 0x57 with no costs at +0x88/+0x90/+0x98), the spec's entry (+0x70), and its spell's
     // entry (+0x60) when that may be unlearned.
@@ -5244,6 +5818,10 @@ namespace
     // CHARACTER_ADVANCEMENT_UPDATE_ENTRIES_RESULT("%b%s%s%u%u", result == CA_UPDATE_ENTRIES_OK, result, ...).
     void __cdecl OnUpdateEntriesResult(void*, uint32_t, uint32_t, CDataStore* p)
     {
+        // The save's own answer, taken or refused: either way nothing is in flight any more.
+        if (g_saveInFlight)
+            AscLog::Printf("CoACompat: save answered, no build in flight");
+        g_saveInFlight = false;
         const std::string result = ReadCStr(p);
         const std::string second = ReadCStr(p);
         uint32_t a, b;
@@ -5288,6 +5866,7 @@ namespace
         sDC.AddPacketHandler(0x72C, CNetClientCustomPacket((void*)&OnUpdateEntriesResult, nullptr));
         sDC.AddPacketHandler(0x65B, CNetClientCustomPacket((void*)&OnUnlockEntryResult, nullptr));
         sDC.AddPacketHandler(0x726, CNetClientCustomPacket((void*)&OnKnownEntries, nullptr));
+        sDC.AddPacketHandler(0x7B4, CNetClientCustomPacket((void*)&OnPreviewState, nullptr));
         sDC.AddPacketHandler(0x728, CNetClientCustomPacket((void*)&OnLearnResult, nullptr));
         sDC.AddPacketHandler(0x729, CNetClientCustomPacket((void*)&OnUnlearnResult, nullptr));
         sDC.AddPacketHandler(0x72A, CNetClientCustomPacket((void*)&OnPurgeResult, nullptr));
@@ -5450,6 +6029,600 @@ namespace
         {nullptr, "CA_GetCreditAmount", CA_GetCreditAmount},
     };
     AscBindings::Module s_module(kBindings, sizeof(kBindings) / sizeof(kBindings[0]), &Init);
+}
+
+// ---- CoA compatibility (the realm's staged-preview protocol) ---------------------------------------
+// The genuine client stages an archetype switch on its own pending build with
+// SwitchActiveChrSpec, and that is all it can stage: `EnterSpec` adds the archetype's identity
+// and signature rows and nothing else, while the rest of its default state - the tree's free
+// rows, the passives the window draws at rank 1 - is the realm's data, not the client DBC's.
+// So the realm stages the switch: this module sends CMSG 0x7B1 with the archetype, the realm
+// answers SMSG 0x7B4 with that archetype's complete default state (handled in OnPreviewState
+// above) and the pending build - the one Save Changes commits - holds exactly it. No client file is
+// involved, and since a browse must not be mistaken for a switch, the window's identity is answered
+// here as well: see `GetActiveChrSpec` below.
+namespace AscCACompat
+{
+    using namespace AscCA;
+    using AscScript::PushBool;        // The realm's custom classes are ids 12..32 (SharedDefines.h CLASS_BARBARIAN..CLASS_SPIRIT_MAGE);
+        // the preview/reset protocol only applies to them.
+        bool IsCoAPlayer()
+        {
+            const uint8_t* player = AscScript::ActivePlayer();
+            return player && UnitClass(player) >= 12 && UnitClass(player) <= 32;
+        }
+
+
+    // The archetype a *staged preview* holds: the pending build names one that the realm's build
+    // does not. Nothing has to remember the staging - the two builds say it - so the answer cannot
+    // go stale: a pending build that comes back to the character's own archetype (the reset below
+    // on the archetype already held, an undo, the save's own state push, a relog's first push)
+    // stops counting the moment it does, and every caller below reads that one predicate.
+    uint32_t PreviewSpec()
+    {
+        // A save in flight is not a browse: the build is on its way to being the character's.
+        if (g_saveInFlight)
+            return 0;
+        if (!g_mgr.pending)
+            return 0;
+        const uint32_t staged = SpecOf(*g_mgr.pending);
+        if (!staged)
+            return 0;
+        // The comparison needs the character's own archetype, and between the realm's active-spec
+        // push (0x725) and the build that follows it (0x726) that archetype's build is still empty:
+        // nothing is staged against anything there, so nothing is reported as a preview. Reading it
+        // as one would drop the build the push has just announced in the window's identity reader.
+        const uint32_t own = ActiveBuild() ? SpecOf(*ActiveBuild()) : 0;
+        if (!own)
+            return 0;
+        return own == staged ? 0 : staged;
+    }
+
+    // One line per answer the window reads while an archetype is browsed, so the ordering of a
+    // report ("the trees repaint", "the tag moves", "N opens the browsed one") can be read off
+    // Logs\Extensions.log instead of guessed at. Silent while nothing is staged: the shipped
+    // answers are the only ones in play then, and they are not ours to narrate.
+    void LogAnswer(const char* question, const char* answer)
+    {
+        if (PreviewSpec())
+            AscLog::Printf("CoACompat: %s -> %s (browse staged)", question, answer);
+    }
+
+    // The window's archetype click goes through SwitchActiveChrSpec. The realm owns the
+    // archetype's defaults - they are its data, not the client DBC's - so the click is routed
+    // there instead of staged locally: the realm answers 0x7B4 with that archetype's complete
+    // default state, and the pending build, the one Save Changes commits, takes it in one
+    // step. Nothing is bumped here on purpose: the click has not changed anything yet, and the
+    // window reads a pending-build event as "the change you asked for is here" - it spends its
+    // `expectingNewSpec` flag on it and repoints the tree at whatever the pending build holds,
+    // which at that moment is still the old archetype.
+    int SwitchActiveChrSpec(lua_State* L)
+    {
+        uint32_t spec;
+        if (!ReadNumber(L, spec))
+            return Usage(L, "Usage: C_CharacterAdvancement.SwitchActiveChrSpec(specID)");
+        if (!IsCoAPlayer())
+            return AscCA::SwitchActiveChrSpec(L);
+        AscLog::Printf("CoACompat: SwitchActiveChrSpec(%u) -> CMSG 0x7B1", spec);
+        AscScript::Packet(0x7B1).U32(spec).Send();
+        return 0;
+    }
+
+    // The window's identity: the archetype the character is on - which, while an archetype is
+    // browsed, is the archetype being browsed. Save Changes commits the *pending* build and prices
+    // it against the character's own, so the identity has to follow the pending build: the staged
+    // archetype is the archetype whose trees are drawn, whose ranks the window shows and whose
+    // departure the next Save prices, and it is the archetype the realm announced for the browse
+    // (0x725). An earlier pass answered the staged archetype to the single read that followed the
+    // staging and the character's own to every other read, dropping the browse with it. The browse
+    // then lived for exactly one read: the trees snapped back to the character's own archetype a
+    // frame later, and a Save clicked after that read priced the character's own build against
+    // itself, found no difference and applied nothing - the same switch saved on some clicks and did
+    // nothing on others, with no cost ever named.
+    //
+    // A browse now ends where the player or the realm actually ends it: the chooser being shown, the
+    // window closing, Undo (`C_CharacterAdvancement.CancelPendingBuild`), another archetype staged,
+    // the character's own archetype staged, or the save's own push. Until one of those happens every
+    // reader is told the archetype being browsed, so the window, the price and the charge are one
+    // build. See `InstallBrowseEnds` in the Lua below for the two ends the window drives.
+    int GetActiveChrSpec(lua_State* L)
+    {
+        if (IsCoAPlayer() && PreviewSpec())
+        {
+            const uint32_t staged = SpecOf(*g_mgr.pending);
+            CoADbg("identity: staged %u [%s]", staged, CoADbgEntries(g_mgr.pending).c_str());
+            LogAnswer("GetActiveChrSpec", "staged (browsing)");
+            AscScript::PushInt(L, static_cast<int32_t>(staged));
+            return 1;
+        }
+        return AscCA::GetActiveChrSpec(L);
+    }
+
+    // TEMPORARY, part of the browse/preview diagnostic: the window's save path decides between its
+    // confirmation dialog and an immediate apply on its own (`CharacterAdvancementUtil
+    // .ConfirmApplyPendingBuild` raises CONFIRM_APPLY_PENDING_BUILD for a nonzero cost and applies
+    // silently for a zero one), so a save that charges without a dialog can only be explained by
+    // reading that decision. The install script below logs it, and the popups the window raises, to
+    // this same file the prices are written to.
+    /* Whether that diagnostic writes, for the one part of it that lives in the client's Lua: that part
+     * wraps two FrameXML globals to narrate the window's save path (the glue's `InstallSaveTrace`), and
+     * a global replaced to narrate a trace that writes nothing is still a global replaced. */
+    int CompatTraceEnabled(lua_State* L)
+    {
+        PushBool(L, CoATraceEnabled());
+        return 1;
+    }
+
+    int CompatTrace(lua_State* L)
+    {
+        const char* message = AscLua::tostring(L, 1);
+        CoADbg("%s", message ? message : "");
+        return 0;
+    }
+
+    // Whether an archetype is being browsed: a staged preview names one that is not the character's
+    // own (`PreviewSpec`). The window's own ends of a browse ask this before dropping one, so that
+    // dropping a browse never touches a change the player has actually made.
+    int IsBrowsingArchetype(lua_State* L)
+    {
+        PushBool(L, IsCoAPlayer() && PreviewSpec() != 0);
+        return 1;
+    }
+
+    // A staged preview is not an unsaved change to the character's build. Everything that asks this
+    // question - the Undo button, the save glow, the close prompt the window raises from OnHide -
+    // describes the player's own tree, and a preview has not touched it: the realm still holds the
+    // same build, closing the window simply drops the preview (`GetActiveChrSpec` above), and the way
+    // back out of one is the realm's own card in the chooser, which the shipped click already asks
+    // for. A real change to the character's own build still
+    // answers true, and a preview is still commitable: Save Changes gates on `CanApplyPendingBuild`,
+    // which prices the staged archetype, not on this.
+    int IsPending(lua_State* L)
+    {
+        if (IsCoAPlayer() && PreviewSpec())
+        {
+            LogAnswer("IsPending", "false (a browse is not a change)");
+            PushBool(L, false);
+            return 1;
+        }
+        /* The realm announces an archetype before it writes that archetype's build (0x725 then 0x726),
+         * and the window reads this question in between - the specialization signal drives
+         * `UpdateActiveSpec`, whose `ShowTreeView` runs `UpdateCommitButtons`. With no build for the
+         * announced archetype the shipped answer compares the pending build against an empty one and
+         * says yes, so the window flashed Undo and the save glow, and raised the close prompt if the
+         * player closed it in that instant, for a change the realm was already writing. There is
+         * nothing to be pending against until the build exists, so the answer is no; the very next
+         * packet answers it for real. */
+        if (IsCoAPlayer() && g_mgr.player && !g_mgr.player->Get(g_mgr.player->spec))
+        {
+            LogAnswer("IsPending", "false (the realm is writing this archetype's build)");
+            PushBool(L, false);
+            return 1;
+        }
+        return AscCA::IsPending(L);
+    }
+
+    // Undo, and the close of a window that was browsing: the shipped discards the pending build and
+    // rebuilds it from the character's own, which is exactly right - what is added here is the
+    // announcement. `ResetPendingBuild` only bumps the version, so the window kept drawing the
+    // discarded build until the manager's next tick (up to a second), and the trees, the commit
+    // buttons and the point counters were all a tick behind a change the player had already made.
+    int CancelPendingBuild(lua_State* L)
+    {
+        const int pushed = AscCA::CancelPendingBuild(L);
+        FlushPendingBuildSignal(true);
+        return pushed;
+    }
+
+    // The save: the window hands the pending build to the realm (CMSG 0x727) and the realm answers
+    // with the build it settled on. From the send until that answer, the pending build is the
+    // character's - it is the one being committed - so nothing may treat it as a browse (see
+    // `g_saveInFlight`). Set after the shipped handler returns, never before: a refusal inside it
+    // raises through Lua and would otherwise leave the flag set for a packet that never went out.
+    int ApplyPendingBuild(lua_State* L)
+    {
+        if (!IsCoAPlayer())
+            return AscCA::ApplyPendingBuild(L);
+        const int pushed = AscCA::ApplyPendingBuild(L);
+        g_saveInFlight = true;
+        AscLog::Printf("CoACompat: ApplyPendingBuild -> CMSG 0x727, save in flight");
+        return pushed;
+    }
+}
+
+namespace AscCACoAGlue
+{
+    // Installed once the world state exists (OnWorldRegistered). This is DLL-side glue for
+    // the popups the client build never shipped (their registrations lived in the retired
+    // consumer add-on): the priced apply and reset confirmations and the close prompt. The
+    // window's own code asks for them by name - `CharacterAdvancementUtil.ConfirmApplyPendingBuild`
+    // shows CONFIRM_APPLY_PENDING_BUILD with the cost the realm's rules computed,
+    // `CoATalentFrameMixin:OnHide` shows the close prompt when IsPending - so without them the
+    // save and reset flows ended silently, with the cost never named. No client file is
+    // modified: the code is registered into the live Lua state from the DLL, exactly the way
+    // the original Extensions.dll ran its own Lua.
+    //
+    // Nothing here decides what the window shows. The window's identity, the archetype its trees
+    // repoint at and the end of a browse are answered by natives (see AscCACompat above), so this
+    // glue no longer hooks the window at all and a hook that installs too early - the frame may not
+    // exist yet when the world state is built - can no longer leave the window on the wrong
+    // archetype.
+    void Install()
+    {
+        // FrameScript_Execute 0x819210(code, 0, 0) - the same call AscRealmData::RunLua makes.
+        const char* const code =
+            "-- CoA character advancement compatibility (installed by Extensions.dll)\n"
+            "local dialogsDone = false\n"\
+            "local function ApplyPending()\n"\
+            "  C_CharacterAdvancement.ApplyPendingBuild()\n"\
+            "  if BuildCreatorUtil and BuildCreatorUtil.GetPendingBuildID and C_BuildCreator then\n"\
+            "    local id = BuildCreatorUtil.GetPendingBuildID()\n"\
+            "    if id then\n"\
+            "      C_BuildCreator.ActivateBuild(id, true, true)\n"\
+            "      BuildCreatorUtil.ClearPendingBuildID()\n"\
+            "    end\n"\
+            "  end\n"\
+            "end\n"\
+            "local function Dialog(key, text, onAccept)\n"\
+            "  if StaticPopupDialogs[key] then return end\n"\
+            "  StaticPopupDialogs[key] = {\n"\
+            "    text = _G[key] or text,\n"\
+            "    button1 = ACCEPT, button2 = CANCEL,\n"\
+            "    timeout = 0, whileDead = 1, hideOnEscape = 1, exclusive = 1, showAlert = 1,\n"\
+            "    OnAccept = onAccept,\n"\
+            "  }\n"\
+            "end\n"\
+            "local function InstallDialogs()\n"\
+            "  if dialogsDone or not StaticPopupDialogs then return end\n"\
+            "  dialogsDone = true\n"\
+            "  Dialog('CONFIRM_APPLY_PENDING_BUILD', 'Apply these changes?\\n\\n%s', ApplyPending)\n"\
+            "  Dialog('CONFIRM_RESET_BUILD', 'Reset this build?\\n\\n%s', ApplyPending)\n"\
+            "  Dialog('CONFIRM_RESET_BUILD_NO_COST', 'Reset this build?', ApplyPending)\n"\
+            "  Dialog('CLOSE_CHARACTER_ADVANCEMENT_UNSAVED_PENDING_CHANGES', 'You have unsaved changes. Close anyway?', function()\n"\
+            "    C_CharacterAdvancement.CancelPendingBuild()\n"\
+            "    local parent = CoATalentFrame and CoATalentFrame:GetParent()\n"\
+            "    if parent then HideUIPanel(parent) end\n"\
+            "  end)\n"\
+            "end\n"\
+            "-- One order for the trees' own refresh pass. `TalentTreeBaseMixin:Update` spends ONE dirty\n"\
+            "-- reason per frame and its rebuild branch wipes the whole table - a rebuild is meant to\n"\
+            "-- supersede a nodes refresh - but nothing enforces that order when both are pending, and the\n"\
+            "-- window itself sets both: `ShowTreeView` marks `Nodes` on both trees and the repoint that\n"\
+            "-- follows marks `RebuildTree` on the spec tree. The spec tree then refreshed the previous\n"\
+            "-- archetype's nodes against the new build and rebuilt them on the following frame - the\n"\
+            "-- second tree visibly repopulating, most visibly when the window is reopened onto the\n"\
+            "-- character's own archetype. The rebuild is consumed first here, which is the order the\n"\
+            "-- shipped pass already implies. Installed once; every mark below re-arms it.\n"\
+            "local TreeReason = TalentTreeBaseMixin and TalentTreeBaseMixin.DirtyReason\n"\
+            "local TreeNodes = TreeReason and TreeReason.Nodes or 1\n"\
+            "local TreeRebuild = TreeReason and TreeReason.RebuildTree or 2\n"\
+            "local TreeGates = TreeReason and TreeReason.RebuildGates or 3\n"\
+            "-- The install is asked for again before every mark, and this call is only the first ask:\n"\
+            "-- the mixin is not in the login state's Lua yet on some logins, where the guarded\n"\
+            "-- install silently did nothing and the shipped pass stayed in place.\n"\
+            "local function InstallTreeOrder()\n"\
+            "  -- In place is the mixin's own method being this pass, not a flag saying it once was.\n"\
+            "  -- The trees run whatever function the mixin holds, and the add-on's files re-executing\n"\
+            "  -- hands the mixin a fresh table whose Update is the shipped one - a flag would then\n"\
+            "  -- vouch for an install that is no longer there, and the ordering this exists for would\n"\
+            "  -- be silently lost while nothing looked wrong.\n"\
+            "  local mixin = TalentTreeBaseMixin\n"\
+            "  if not (mixin and mixin.Update) then return false end\n"\
+            "  if mixin.Update == CoACompatTreeOrder then return true end\n"\
+            "  local base = mixin.Update\n"\
+            "  CoACompatTreeOrder = function(self)\n"\
+            "    -- A nodes refresh is only ever valid on a tree whose frames are already built, and\n"\
+            "    -- both the rebuild and the gate build wipe and refill the frames it indexes\n"\
+            "    -- (`BuildTree` empties `gateCache`, `CreateGates` gives each entry its gate).\n"\
+            "    -- Cheap to drop: the rebuild drew the nodes itself, and `CreateGates` ends in\n"\
+            "    -- `UpdateGates`.\n"\
+            "    if self.dirty and (self.dirty[TreeRebuild] or self.dirty[TreeGates]) then\n"\
+            "      self.dirty[TreeNodes] = nil\n"\
+            "    end\n"\
+
+            "    return base(self)\n"\
+            "  end\n"\
+            "  mixin.Update = CoACompatTreeOrder\n"\
+            "  return true\n"\
+            "end\n"\
+            "InstallTreeOrder()\n"\
+            "-- The other half of the same ordering: a nodes pass ends in `UpdateGates`, which reads\n"\
+            "-- `gateInfo.gate` for every cached gate, and only the gate build gives an entry its frame.\n"\
+            "-- The rebuild refills the cache and marks the gate build, so any pass that reaches the\n"\
+            "-- nodes branch first - the dirty table is walked with `next`, and that order is the\n"\
+            "-- table's own - indexes a gate that has never been created: 'TalentTreeBase.lua attempt\n"\
+            "-- to index local gate (a nil value)' out of `UpdateGates`, on the archetype whose tree\n"\
+            "-- was just repointed. The order above is what the shipped pass implies and it is\n"\
+            "-- installed by every mark; this is the invariant itself, held at the read site so it\n"\
+            "-- holds whatever pass happens to be in effect, including the shipped one on a session\n"\
+            "-- whose window was drawn before the order could be installed. Safe to re-enter: the\n"\
+            "-- gate build ends in this same call, which then finds every entry framed.\n"\
+            "local function InstallGateGuard()\n"\
+            "  -- Verified the same way, and for the same reason (see InstallTreeOrder).\n"\
+            "  local mixin = TalentTreeBaseMixin\n"\
+            "  if not (mixin and mixin.UpdateGates) then return false end\n"\
+            "  if mixin.UpdateGates == CoACompatGateGuard then return true end\n"\
+            "  local base = mixin.UpdateGates\n"\
+            "  local building = false\n"\
+            "  CoACompatGateGuard = function(self)\n"\
+            "    if not building and self.useGates and self.gateCache and self.getGateTemplate\n"\
+            "        and self.getGateAttachmentPoint and self.gateCurrencyCount then\n"\
+            "      for _, gateInfo in ipairs(self.gateCache) do\n"\
+            "        if not gateInfo.gate then\n"\
+            "          building = true\n"\
+            "          self:CreateGates()\n"\
+            "          building = false\n"\
+            "          break\n"\
+            "        end\n"\
+            "      end\n"\
+            "    end\n"\
+            "    return base(self)\n"\
+            "  end\n"\
+            "  mixin.UpdateGates = CoACompatGateGuard\n"\
+            "  return true\n"\
+            "end\n"\
+            "InstallGateGuard()\n"\
+            "-- The guards above are on the mixin, and the trees do not read the mixin: `MixinAndLoadScripts`\n"\
+            "-- in the tree templates copies it onto each frame as that frame is built, so a tree built\n"\
+            "-- before this glue ran keeps the shipped pass for the whole session - and the window's own\n"\
+            "-- `MarkDirty` re-arms `OnUpdate` from the frame's own field, which is that copy, undoing\n"\
+            "-- the re-arm the mark below does. Hence the third install: the same two guards, on the\n"\
+            "-- frames themselves, where nothing copies them away - the order on `Update` (what the\n"\
+            "-- frame re-arms) and the gate build on `UpdateGates` (what the nodes branch reads through).\n"\
+            "-- Idempotent, and re-asserted whenever the window is shown, when a build is written\n"\
+            "-- (`CoACompatMarkTrees`), and at every install.\n"\
+            "local function GuardTree(tree)\n"\
+            "  if not tree or tree.coaTreeGuarded then return tree ~= nil end\n"\
+            "  tree.coaTreeGuarded = true\n"\
+            "  local pass = tree.Update\n"\
+            "  if pass and pass ~= CoACompatTreeOrder then\n"\
+            "    tree.Update = function(self)\n"\
+            "      if self.dirty and (self.dirty[TreeRebuild] or self.dirty[TreeGates]) then\n"\
+            "        self.dirty[TreeNodes] = nil\n"\
+            "      end\n"\
+            "      return pass(self)\n"\
+            "    end\n"\
+            "  end\n"\
+            "  local gates = tree.UpdateGates\n"\
+            "  if gates and gates ~= CoACompatGateGuard then\n"\
+            "    local building = false\n"\
+            "    tree.UpdateGates = function(self)\n"\
+            "      if not building and self.useGates and self.gateCache and self.getGateTemplate\n"\
+            "          and self.getGateAttachmentPoint and self.gateCurrencyCount then\n"\
+            "        for _, gateInfo in ipairs(self.gateCache) do\n"\
+            "          if not gateInfo.gate then\n"\
+            "            -- A build that fails must not leave this flag set: the guard would then never\n"\
+            "            -- build again, and every later read would index a gate that was never made.\n"\
+            "            -- The failure itself still reaches whoever ran the pass.\n"\
+            "            building = true\n"\
+            "            local ok, err = pcall(self.CreateGates, self)\n"\
+            "            building = false\n"\
+            "            if not ok then error(err, 0) end\n"\
+            "            break\n"\
+            "          end\n"\
+            "        end\n"\
+            "      end\n"\
+            "      return gates(self)\n"\
+            "    end\n"\
+            "  end\n"\
+            "  -- Whatever the frame had armed is still spent, and now by the ordered pass.\n"\
+            "  if tree.dirty and next(tree.dirty) and tree.Update then\n"\
+            "    tree:SetScript('OnUpdate', tree.Update)\n"\
+            "  end\n"\
+            "  return true\n"\
+            "end\n"\
+            "local function GuardWindowTrees()\n"\
+            "  local view = CoATalentFrame and CoATalentFrame.TreeView\n"\
+            "  if not view then return false end\n"\
+            "  GuardTree(view.ClassTree)\n"\
+            "  GuardTree(view.SpecTree)\n"\
+            "  return true\n"\
+            "end\n"\
+            "local function InstallTreeGuards()\n"\
+            "  GuardWindowTrees()\n"\
+            "  -- The window is built by the archetype add-on, which this glue can precede. Its own\n"\
+            "  -- OnShow is where a window that appears later is caught: showing it is what rebuilds\n"\
+            "  -- the trees, and this hook runs in that same frame, before the pass they arm.\n"\
+            "  local frame = CoATalentFrame\n"\
+            "  if not (frame and frame.HookScript) or frame.coaTreeGuardsHooked then return true end\n"\
+            "  frame.coaTreeGuardsHooked = true\n"\
+            "  frame:HookScript('OnShow', GuardWindowTrees)\n"\
+            "  return true\n"\
+            "end\n"\
+            "InstallTreeGuards()\n"\
+            "local function MarkTree(tree)\n"\
+            "  if not (tree and tree.MarkDirty) then return end\n"\
+            "  tree:MarkDirty(TreeNodes)\n"\
+            "  -- Whatever the mark armed, the ordered pass is what runs.\n"\
+            "  local order = CoACompatTreeOrder or tree.Update\n"\
+            "  if order then tree:SetScript('OnUpdate', order) end\n"\
+            "  -- Spent in this call, not on the next frame: the window is opened and drawn in one\n"\
+            "  -- beat, and a rebuild left to OnUpdate paints the archetype it came from for the\n"\
+            "  -- frame the window comes up on - the snap when it is reopened after a preview.\n"\
+            "  if tree.Update then tree:Update() end\n"\
+            "end\n"\
+            "-- The two trees, told from the DLL which build they must draw (see AscCA::MarkWindowTrees).\n"\
+            "-- A tree that is hidden when the build is written never hears the announcement - the trees\n"\
+            "-- only subscribe to it in OnShow - so the mark is left on the tree itself, which the trees\n"\
+            "-- keep while hidden and spend on the first frame they are visible. The class tree's tab is\n"\
+            "-- the class, fixed for the window's whole life, so a new build changes only the ranks it\n"\
+            "-- draws: it always takes `Nodes`. The spec tree takes `Nodes` only when it is already\n"\
+            "-- drawing this spec; otherwise it is repointed here, which is the rebuild it needs, because\n"\
+            "-- `SetSpecID` is the only call that repoints it and `ShowTreeView` - the path a click on the\n"\
+            "-- character's own card takes - does not.\n"\
+            "function CoACompatMarkTrees(specID)\n"\
+            "  local view = CoATalentFrame and CoATalentFrame.TreeView\n"\
+            "  if not view then return end\n"\
+            "  InstallTreeOrder()    -- the installs the login state may have had to defer\n"\
+            "  InstallTreeGuards()\n"\
+
+            "  MarkTree(view.ClassTree)\n"\
+            "  if not view.SpecTree then return end\n"\
+            "  if view.specID == specID then\n"\
+            "    MarkTree(view.SpecTree)\n"\
+            "  else\n"\
+            "    -- The repoint is the client's own `SetSpecID`, and it reads the spec's own record and\n"\
+            "    -- DBC straight out of `GetSpecInfoByID`: an archetype this client's DBCs cannot draw\n"\
+            "    -- would be indexed into a nil `specInfo.Spec` there, and a DBC this client has no\n"\
+            "    -- file for would leave the tree tabless (`SetClassTab(classDBC, nil)`), which its own\n"\
+            "    -- rebuild then asserts on. So the repoint is asked for only when the client can draw\n"\
+            "    -- it, and the mark above still refreshes the ranks of the tree already drawn.\n"\
+            "    local specInfo = C_ClassInfo and C_ClassInfo.GetSpecInfoByID and specID and specID ~= 0\n"\
+            "        and C_ClassInfo.GetSpecInfoByID(specID)\n"\
+            "    local specDBC = specInfo and specInfo.Spec and CharacterAdvancementUtil\n"\
+            "        and CharacterAdvancementUtil.GetSpecDBCByFile and CharacterAdvancementUtil.GetSpecDBCByFile(specInfo.Spec)\n"\
+            "    if view.SetSpecID and specInfo and specInfo.Class and specInfo.Name and specDBC then\n"\
+            "      view:SetSpecID(specID)\n"\
+            "      if view.SpecTree.Update then view.SpecTree:Update() end\n"\
+            "    else\n"\
+            "      local trace = C_CharacterAdvancement.CompatTrace\n"\
+            "      if trace and specID and specID ~= 0 then\n"\
+            "        trace('mark: spec ' .. tostring(specID) .. ' is not drawable by this client; tree left on ' .. tostring(view.specID))\n"\
+            "      end\n"\
+            "    end\n"\
+            "  end\n"\
+            "end\n"\
+            "-- What ends a browse. A browse is answered as the window's identity until something ends\n"\
+            "-- it, so its ends have to be named rather than left to whichever read of the identity\n"\
+            "-- happens to come next (see AscCACompat::GetActiveChrSpec). Two of them are the window's\n"\
+            "-- own: closing it, because reopening the window is asking about the character and not\n"\
+            "-- about the archetype being browsed, and showing the archetype chooser, which is where\n"\
+            "-- the player goes to pick another archetype or to come back to the character's own. Both\n"\
+            "-- drop only a browse: a change the player has actually made (IsPending) is left alone,\n"\
+            "-- and closing with one of those keeps the shipped unsaved-changes prompt. Hooked on the\n"\
+            "-- frames, not on the mixin tables: the frames are built with `MixinAndLoadScripts`, so a\n"\
+            "-- method replaced on the table afterwards is one the frame no longer calls.\n"\
+            "local browseEndsDone = false\n"\
+            "-- Global as well as called below: the staging that starts a browse installs these too\n"\
+            "-- (`EnsureBrowseEnds`), because both events below can have passed by the time the window\n"\
+            "-- this hooks exists, and a browse that outlives its window is what that cost.\n"\
+            "function CoACompatInstallBrowseEnds()\n"\
+            "  if browseEndsDone then return end\n"\
+            "  local frame = CoATalentFrame\n"\
+            "  if not (frame and frame.HookScript and frame.UpdateActiveSpec and frame.ShowSpecView\n"\
+            "      and C_CharacterAdvancement.IsBrowsingArchetype) then return end\n"\
+            "  local function EndBrowse(refresh)\n"\
+            "    if not C_CharacterAdvancement.IsBrowsingArchetype() then return end\n"\
+            "    C_CharacterAdvancement.CancelPendingBuild()\n"\
+            "    if not refresh then return end\n"\
+            "    -- The chooser paints a card per archetype from the window's identity, and its own OnShow\n"\
+            "    -- has already run by this point - so the card the browse left behind was painted as\n"\
+            "    -- Active, and the trees behind it were still the browsed archetype's. Ask the window to\n"\
+            "    -- move back onto the character's own archetype and to paint the chooser once more: the\n"\
+            "    -- refresh passes through the tree view on its way, hiding the chooser, so showing it\n"\
+            "    -- again runs its OnShow a second time against the identity the browse no longer holds.\n"\
+            "    frame:UpdateActiveSpec()\n"\
+            "    frame:ShowSpecView()\n"\
+            "  end\n"\
+            "  if not frame.coaBrowseEndsHooked then\n"\
+            "    frame.coaBrowseEndsHooked = true\n"\
+            "    frame:HookScript('OnHide', function() EndBrowse(false) end)\n"\
+            "  end\n"\
+            "  -- Both hooks have to be in before this counts as installed: the chooser's own OnShow is\n"\
+            "  -- what ends the browse the window's closing does not, and the window itself can be built\n"\
+            "  -- before the chooser's frame is. If it is not there yet, the next staging retries.\n"\
+            "  local specView = frame.SpecView\n"\
+            "  if not (specView and specView.HookScript and specView.OnShow) then return end\n"\
+            "  specView:HookScript('OnShow', function() EndBrowse(true) end)\n"\
+            "  browseEndsDone = true\n"\
+            "  local trace = C_CharacterAdvancement.CompatTrace\n"\
+            "  if trace then trace('install: browse ends hooked (window OnHide, chooser OnShow)') end\n"\
+            "end\n"\
+            "-- The browse/preview diagnostic, when it is asked for (COA_COMPAT_TRACE): what the window's\n"\
+            "-- own save path\n"\
+            "-- decided, and every popup it raised. `ConfirmApplyPendingBuild` is the window's own\n"\
+            "-- gate - it raises `CONFIRM_APPLY_PENDING_BUILD` when the price it reads is nonzero and\n"\
+            "-- applies the build straight away when it is zero - so a save that takes a cost without\n"\
+            "-- a dialog is read off these lines against the `canApply`/`apply` prices. Wrapped on the\n"\
+            "-- utility table and the popup global, both FrameXML's, so no binding of ours is replaced\n"\
+            "-- and a FrameXML reload re-installs this like the rest.\n"\
+            "local function InstallSaveTrace()\n"\
+            "  if CoACompatSaveTrace then return end\n"\
+            "  local trace = C_CharacterAdvancement.CompatTrace\n"\
+            "  local enabled = C_CharacterAdvancement.CompatTraceEnabled\n"\
+            "  -- Asked for, or this is not installed at all: it replaces two FrameXML globals, and a\n"\
+            "  -- global replaced to narrate a trace that writes nothing is still a global replaced.\n"\
+            "  if not (trace and enabled and enabled() and CharacterAdvancementUtil\n"\
+            "      and CharacterAdvancementUtil.ConfirmApplyPendingBuild and StaticPopup_Show) then return end\n"\
+            "  CoACompatSaveTrace = true\n"\
+            "  local shown = StaticPopup_Show\n"\
+            "  StaticPopup_Show = function(which, arg1, arg2, data)\n"\
+            "    trace('popup ' .. tostring(which) .. ' | ' .. tostring(arg1))\n"\
+            "    return shown(which, arg1, arg2, data)\n"\
+            "  end\n"\
+            "  local confirm = CharacterAdvancementUtil.ConfirmApplyPendingBuild\n"\
+            "  CharacterAdvancementUtil.ConfirmApplyPendingBuild = function(...)\n"\
+            "    local _, _, _, _, _, marks, gold = C_CharacterAdvancement.CanApplyPendingBuild()\n"\
+            "    local priced = (marks and marks > 0) or (gold and gold > 0)\n"\
+            "    trace('confirm: marks=' .. tostring(marks) .. ' gold=' .. tostring(gold) .. ' -> '\n"\
+            "      .. (priced and 'DIALOG' or 'SILENT APPLY'))\n"\
+            "    return confirm(...)\n"\
+            "  end\n"\
+            "end\n"\
+            "-- One step at a time: these hook the window's own functions, and a step that fails used\n"\
+            "-- to take every later one with it - the browse ends among them, which is how a browse\n"\
+            "-- could outlive the window it belonged to. A failure is named, not swallowed.\n"\
+            "local function Note(msg)\n"\
+            "  local trace = C_CharacterAdvancement.CompatTrace\n"\
+            "  if trace then trace('install: ' .. msg) end\n"\
+            "  print('CoACompat: ' .. msg)\n"\
+            "end\n"\
+            "local function InstallStep(name, fn)\n"\
+            "  local ok, err = pcall(fn)\n"\
+            "  if not ok then Note(name .. ' failed: ' .. tostring(err)) end\n"\
+            "end\n"\
+            "local function InstallAll()\n"\
+            "  InstallStep('InstallDialogs', InstallDialogs)\n"\
+            "  InstallStep('InstallTreeOrder', InstallTreeOrder)\n"\
+            "  InstallStep('InstallGateGuard', InstallGateGuard)\n"\
+            "  InstallStep('InstallTreeGuards', InstallTreeGuards)\n"\
+            "  InstallStep('InstallBrowseEnds', CoACompatInstallBrowseEnds)\n"\
+            "  InstallStep('InstallSaveTrace', InstallSaveTrace)\n"\
+            "end\n"\
+            "local f = CreateFrame('Frame')\n"\
+            "f:RegisterEvent('ADDON_LOADED')\n"\
+            "f:RegisterEvent('PLAYER_ENTERING_WORLD')\n"\
+            "f:SetScript('OnEvent', InstallAll)\n"\
+            "InstallAll()\n";
+        reinterpret_cast<void(__cdecl*)(const char*, int, int)>(0x819210)(code, 0, 0);
+        // The helper above exists now, so the marks can be asked for.
+        AscCA::g_windowTrees = true;
+    }
+    bool s_installed = false;
+}
+
+// The binding below registers after the genuine module's own (AscBindings registers the modules
+// in construction order, so this one reroutes the entries it owns) and installs the Lua glue once
+// the world state is built. Each entry is a single question the window asks and the shipped answer
+// gets wrong for a staged archetype: which archetype the character is on (`GetActiveChrSpec`),
+// whether a browse is an unsaved change (`IsPending`), what a click on an archetype card asks the
+// realm for (`SwitchActiveChrSpec`) and what closing a browse discards (`CancelPendingBuild`).
+// `IsBrowsingArchetype` is the one the DLL adds for itself: the window's own ends of a browse ask it
+// (see `InstallBrowseEnds`) so they can drop a browse without touching a change the player made.
+namespace
+{
+    const AscBindings::Binding kCoACompatBindings[] = {
+        {"C_CharacterAdvancement", "SwitchActiveChrSpec", AscCACompat::SwitchActiveChrSpec},
+        {"C_CharacterAdvancement", "CancelPendingBuild", AscCACompat::CancelPendingBuild},
+        {"C_CharacterAdvancement", "IsPending", AscCACompat::IsPending},
+        {"C_CharacterAdvancement", "GetActiveChrSpec", AscCACompat::GetActiveChrSpec},
+        {"C_CharacterAdvancement", "IsBrowsingArchetype", AscCACompat::IsBrowsingArchetype},
+        {"C_CharacterAdvancement", "ApplyPendingBuild", AscCACompat::ApplyPendingBuild},
+        // The browse/preview diagnostic (see AscCACompat::CoATraceEnabled): the writer, and whether it
+        // writes at all, which is what the glue's save-path wrappers ask before installing.
+        {"C_CharacterAdvancement", "CompatTrace", AscCACompat::CompatTrace},
+        {"C_CharacterAdvancement", "CompatTraceEnabled", AscCACompat::CompatTraceEnabled},
+    };
+    void CoACompatInit()
+    {
+        if (!AscCACoAGlue::s_installed)
+        {
+            AscCACoAGlue::s_installed = true;
+            AscBindings::OnWorldRegistered(&AscCACoAGlue::Install);
+        }
+    }
+    AscBindings::Module s_coaCompatModule(kCoACompatBindings,
+        sizeof(kCoACompatBindings) / sizeof(kCoACompatBindings[0]), &CoACompatInit);
 }
 // ---- for the browser filters (AscCAFilter.cpp) -----------------------------------------------------
 bool HiddenFromIndex(Row r) { return HiddenBase(r, false); }                 // FUN_101c67c0(0)
