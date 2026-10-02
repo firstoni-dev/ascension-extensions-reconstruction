@@ -291,9 +291,17 @@ namespace
         VirtualProtect(reinterpret_cast<void*>(at), n, old, &old);
     }
 
-    // The operand of the client's rune-UI class check (`cmp ebx, 6` at 0x728AA1): 10 while a rune spell
-    // is known (FUN_1016d5b0), back to 6 when none is (FUN_10173330).
-    void SetRuneClass(uint8_t cls) { WriteCode(0x728AA3, &cls, 1); }
+    // The client regenerates runes (0x728A20) only for the active player whose display power type
+    // (UNIT_FIELD_BYTES_0 byte 3) matches the operand of `cmp ebx, 6` at 0x728AA1. The original writes 10
+    // there while a rune spell is known (FUN_1016d5b0) and 6 when none is (FUN_10173330). A CoA server
+    // gives the Hero its class's mana, so while a rune spell is known the check becomes `cmp ebx, ebx` and
+    // the runes regenerate whatever the display power is.
+    void SetRuneRegeneration(bool runeSpellKnown)
+    {
+        static const uint8_t kAlways[3] = {0x39, 0xDB, 0x90};       // cmp ebx, ebx; nop
+        static const uint8_t kRunicPower[3] = {0x83, 0xFB, 0x06};   // cmp ebx, 6
+        WriteCode(0x728AA1, runeSpellKnown ? kAlways : kRunicPower, 3);
+    }
 
     // FUN_10308830: while > 0, three client calls (0x5216F0 at 0x542679 / 0x5427BE / 0x54284E) are NOPed.
     void SuppressLearnCalls(bool on)
@@ -324,7 +332,7 @@ namespace
         if (FetchSpell(spell, rec) && *reinterpret_cast<const uint32_t*>(rec + 0x288))
         {
             g_runeSpells.insert(spell);
-            SetRuneClass(10);
+            SetRuneRegeneration(true);
         }
         for (uint32_t tag : SpellTagsOf(spell))
             g_knownTags.insert(tag);
@@ -350,7 +358,7 @@ namespace
             {
                 g_runeSpells.erase(spell);
                 if (g_runeSpells.empty())
-                    SetRuneClass(6);
+                    SetRuneRegeneration(false);
             }
         }
         std::unordered_set<uint32_t> stillTagged;
@@ -1348,7 +1356,7 @@ namespace
         g_mgr.inspect.clear();
         g_knownSpells.clear();   // +0x3E8 (FUN_100df440)
         g_runeSpells.clear();    // +0x408
-        SetRuneClass(6);         // 0x728AA3 = 6 (missing until 2026-09-27; the live audit showed 6 in the original)
+        SetRuneRegeneration(false);   // 0x728AA3 = 6 (missing until 2026-09-27; the live audit showed 6 in the original)
         g_knownTags.clear();     // +0x428
         g_mgr.suggestionOverrides.clear();   // +0x44C
         g_pendingSignal = false;             // DAT_10bde424
