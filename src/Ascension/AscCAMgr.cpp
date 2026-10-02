@@ -1019,6 +1019,18 @@ void RequestAutoLearn() { g_mgr.autoLearn = true; }
 
 uint64_t BumpPendingVersion() { return ++g_pendingVersion; }
 
+uint32_t AbilityCount(const Build& b)
+{
+    uint32_t count = 0;
+    for (const Entry& e : b.entries)
+        if (Row r = FindRow(e.id))
+        {
+            const int type = RowType(r);
+            count += type == 1 || type == 4;
+        }
+    return count;
+}
+
 void ResetPendingBuild()
 {
     Build* next = new Build(*ActiveBuild(), true);

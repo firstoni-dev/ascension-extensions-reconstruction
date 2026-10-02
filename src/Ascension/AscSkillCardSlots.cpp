@@ -57,7 +57,7 @@ namespace
         if (const AscCA::Build* b = AscCA::ActiveBuild())
         {
             if (b->wildcard)
-                phase = b->u44 < AscWildcardRolls::StartingCount();   // FUN_10159210
+                phase = AscCA::AbilityCount(*b) < AscWildcardRolls::StartingCount();   // FUN_10159210
             else if (b->draft)
                 phase = b->GlobalAE(0) < (((AscGameMode::Mode() >> 7) & 1) ? 0x12u : 8u);
         }

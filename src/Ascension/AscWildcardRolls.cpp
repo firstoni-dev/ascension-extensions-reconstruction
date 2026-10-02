@@ -244,7 +244,7 @@ namespace
     int CanResetAbilities(lua_State* L)   // handler_CanResetAbilities -> FUN_10155680
     {
         const AscCA::Build* b = AscCA::ActiveBuild();
-        PushBool(L, b && b->wildcard && b->u44 <= StartingCount());
+        PushBool(L, b && b->wildcard && AscCA::AbilityCount(*b) <= StartingCount());
         return 1;
     }
 
@@ -258,7 +258,7 @@ namespace
     bool CanShowStartingChoice()   // FUN_10a2f920
     {
         const AscCA::Build* b = AscCA::ActiveBuild();
-        return !RevealsPending() && b && b->wildcard && b->u44 <= StartingCount();
+        return !RevealsPending() && b && b->wildcard && AscCA::AbilityCount(*b) <= StartingCount();
     }
     int CanShowStartingChoice(lua_State* L)
     {
@@ -281,14 +281,14 @@ namespace
     int WillRollStartingAbilities(lua_State* L)   // FUN_10159210
     {
         const AscCA::Build* b = AscCA::ActiveBuild();
-        PushBool(L, b && b->wildcard && b->u44 < StartingCount());
+        PushBool(L, b && b->wildcard && AscCA::AbilityCount(*b) < StartingCount());
         return 1;
     }
 
     int WillRollFirstNonStartingAbility(lua_State* L)   // FUN_101591f0
     {
         const AscCA::Build* b = AscCA::ActiveBuild();
-        PushBool(L, b && b->wildcard && b->u44 == StartingCount());
+        PushBool(L, b && b->wildcard && AscCA::AbilityCount(*b) == StartingCount());
         return 1;
     }
 

@@ -189,6 +189,10 @@ namespace AscCA
 
     int ActiveSpecIndex();     // FUN_1016f580: the player record's active spec, -1 without one
     Build* ActiveBuild();      // FUN_1016f390: the player's build for the active spec, else the default build
+    // The build's ability rows (types 1 and 4), what +0x44 caches. The original fills +0x44 only on the
+    // first pending-build update after the known entries arrive, so a check right after a fresh client
+    // start reads 0; the Wildcard starting phase checks count here instead.
+    uint32_t AbilityCount(const Build& b);
     Build* PendingBuild();     // mgr +0x24, nullptr when none
     void ResetPendingBuild();  // FUN_10173d00
 
