@@ -24,7 +24,8 @@ although their sites are the other way round.
   image; its address is only materialized at runtime (a VM lane cell, `.vm_sec` + `0xD70088`). It is not
   reconstructed; `InsertByCapturedOrder`'s *unknown callbacks follow the captured entries* rule
   reproduces its position.
-- Behaviour — a spell veto called as `(unit, a, rec)`; `false` suppresses the aura application:
+- Behaviour — a spell veto called as `(unit, a, rec)`; `false` suppresses the aura application
+  (the detour returns without calling the original `0x724820`):
 
 ```c
 bool AuraVeto(void* unit, uint32_t, uint32_t rec)
@@ -47,6 +48,25 @@ bool AuraVeto(void* unit, uint32_t, uint32_t rec)
 (Flag `8` = GM, `0x8000` = developer; `AccountInfo()` is the TLS account object accessor —
 our `FUN_1008c870` class. All five spell ids are Ascension custom spells, absent from the shipped
 `Spell.dbc`.)
+
+### Spell identification — the client's Mentor / Newcomer / Returning-Player / overhead-icon handling
+
+The five ids are CoA's community and staff marker spells (community-archive identification, not server
+data — AscensionDB preservation archive, "Jeff-Fro CoA in-game spell tooltip capture", 2026-09-02,
+snapshot `2aa98857`):
+
+| id | name | captured tooltip |
+| --- | --- | --- |
+| `0x79BB0` (498608) | **Mentor** | `Mentor` |
+| `0x79C3F` (498751) | **Mentor** | `Mentor \| I am a Mentor and I am here to help! New players can ask me questions about the game!` |
+| `0x79BC5` (498629) | **Overhead Icon - Ascension Logo** | `Overhead Icon - Ascension Logo \| Instant` |
+| `0x79C40` (498752) | **New Player Help - Newcomer** | `New Player Help - Newcomer \| Instant` |
+| `0x978960` (9931104) | **Returning Player** | — |
+
+The condition split mirrors the names: the two Mentor spells share the account byte `0x0C` branch, the
+Newcomer / Returning-Player pair shares the `0x0D` branch, and the Ascension-logo overhead icon has its
+own rule. Note the GM flag never suppresses here — it is only ever an *allow* path; the one suppressing
+flag is `0x8000` (developer), and the tag pairs additionally never apply to your own active player.
 
 ## Measurement and validation
 
