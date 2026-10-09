@@ -771,7 +771,15 @@ void OnBeforeTargetChange(Callback cb) { BeforeTargetList().push_back(cb); }
 void OnAfter52A980(Callback cb) { After52A980List().push_back(cb); }
 void OnAfterTargetChange(Callback cb) { AfterTargetList().push_back(cb); }
 void OnBefore6ECF80(void (*cb)(uint32_t)) { Before6ECF80List().push_back(cb); }
-void OnBefore724820(UnitSpellVeto cb, uint32_t site) { InsertBySite(Before724820List(), cb, site); }
+void OnBefore724820(UnitSpellVeto cb, uint32_t site)
+{
+    // Closed native list 0x10BE2B6C: AscAura137::BeforeApply, AscSpellVisuals::BeforeAuraApply,
+    // AscSpellMods::AuraFlagOn, AscAppearance::BeforeAuraApply, AscSpawnVisibility::BeforeAuraApply;
+    // an original-only sixth callback that is not reconstructed runs last. Registration execution
+    // order differs from the call-site order, so the captured order is authoritative.
+    static const uint32_t order[] = {0x10A683D0, 0x10323151, 0x10324D9A, 0x100C5B88, 0x101A2025};
+    InsertByCapturedOrder(Before724820List(), cb, site, order);
+}
 void OnBefore71E930(UnitSpellVeto cb, uint32_t site)
 {
     // Closed native list 0x10BE2B8C: AscAura137::BeforeRemove, AscSpellMods::AuraFlagOff.
@@ -784,8 +792,18 @@ void OnAfter80B5D0(CastVeto cb, uint32_t site)
     static const uint32_t order[] = {0x10324DB8, 0x10324DAE, 0x10171F65};
     InsertByCapturedOrder(After80B5D0List(), cb, site, order);
 }
-void OnEffectFilter(EffectFilter cb, uint32_t site) { InsertBySite(EffectFilterList(), cb, site); }
-void OnVisualHide(VisualHide cb, uint32_t site) { InsertBySite(VisualHideList(), cb, site); }
+void OnEffectFilter(EffectFilter cb, uint32_t site)
+{
+    // Closed native list 0x10BE2D78: AscSpellVisuals::RemoveEffect, AscQuestSpellHide::RemoveEffect.
+    static const uint32_t order[] = {0x1032313D, 0x10112625};
+    InsertByCapturedOrder(EffectFilterList(), cb, site, order);
+}
+void OnVisualHide(VisualHide cb, uint32_t site)
+{
+    // Closed native list 0x10BE2D98: AscSpellVisuals::HideVisual, AscQuestSpellHide::HideVisual.
+    static const uint32_t order[] = {0x10323147, 0x1011262F};
+    InsertByCapturedOrder(VisualHideList(), cb, site, order);
+}
 bool VisualHidden(uint32_t kind, uint32_t guidLo, uint32_t guidHi, uint32_t spell)
 {
     for (auto& cb : VisualHideList())
