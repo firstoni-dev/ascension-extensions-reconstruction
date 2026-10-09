@@ -40,15 +40,20 @@ The portable regression in `tests/native_ca_packets.py` compiles the production 
 against client API doubles. It covers initial state, listener timing, subsequent updates, new preset slots
 and missing local units. It does not launch the game or replace the 32-bit Windows DLL build.
 
-`tests/native_callback_order.py` exercises the production cast and aura-removal registrars and detours
-against the original DLL's measured linked-list traversal, including registration permutations and vetoes.
+`tests/native_callback_order.py` exercises the production cast, aura-removal and aura-application
+registrars and detours, and the effect-filter and visual-hide registrars and consumer, against the
+original DLL's measured linked-list traversal, including registration permutations and vetoes.
 The original uses MSVC `unordered_set` callbacks: cast checks run aura requirements, stack requirements,
-then class requirements; aura removal runs `AscAura137` before `AscSpellMods`. These two snapshots include
-all corresponding callbacks in this source. Their native hash-bucket relationships remain identical
-at every allocation-aligned 32-bit image base, so relocating the DLL preserves these orders.
-Aura application, effect filtering and visual hiding still
-use call-site ordering: their startup snapshots do not yet cover every reconstructed callback. Future
-unknown callbacks in the two measured lists follow the captured entries in call-site order.
+then class requirements; aura removal runs `AscAura137` before `AscSpellMods`; aura application runs
+`AscAura137`, `AscSpellVisuals`, `AscSpellMods`, `AscAppearance`, then `AscSpawnVisibility`; effect
+filtering and visual hiding run `AscSpellVisuals` before `AscQuestSpellHide`. These snapshots include
+all corresponding callbacks in this source; the two emulated lists' native hash-bucket relationships
+remain identical at every allocation-aligned 32-bit image base, so relocating the DLL preserves these
+orders.
+All five captured lists insert by the measured order (`InsertByCapturedOrder`): call-site ordering did
+not reproduce them because registration execution order does not follow the call sites. The
+aura-application list also carries one original-only callback that is not reconstructed - it runs after
+the five captured entries, matching the rule that unknown callbacks follow the captured entries.
 
 ## Building
 

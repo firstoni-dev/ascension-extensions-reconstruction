@@ -4,8 +4,8 @@
   "hash_helper": "0x100996e0",
   "hash": "FNV-1a over four little-endian relocated callback-pointer bytes",
   "bucket_mask": 7,
-  "method": "Offline x86 startup emulation; follow head->next nodes to head, reading callback at node+8; closed list count verified.",
-  "limits": "Observed startup prefix only; later original-only registrations and other lists are unmeasured.",
+  "method": "Offline x86 startup emulation for Before71E930 / After80B5D0: follow head->next nodes to head, reading callback at node+8; closed list count verified. Before724820 / EffectFilter / VisualHide additionally measured from live list traversal in two independent game sessions of a sibling build; addresses translated with per-band deltas validated against both emulated lists.",
+  "limits": "Before71E930 and After80B5D0 are complete for this image. Before724820 carries one original-only callback (runtime-registered, no static call site, not reconstructed) that runs after the five captured entries. Remaining lists are unmeasured.",
   "Before71E930": {
     "object": "0x10be2b8c",
     "callbacks": [
@@ -19,6 +19,32 @@
       {"name": "AscSpellMods::AuraRequirement", "function": "0x10326780", "site": "0x10324db8"},
       {"name": "AscSpellMods::StackRequirement", "function": "0x103267e0", "site": "0x10324dae"},
       {"name": "AscCAMgr::CastRequirements", "function": "0x1016fde0", "site": "0x10171f65"}
+    ]
+  },
+  "Before724820": {
+    "object": "0x10be2b6c",
+    "callbacks": [
+      {"name": "AscAura137::BeforeApply", "function": "0x10a4e2e0", "site": "0x10a683d0"},
+      {"name": "AscSpellVisuals::BeforeAuraApply", "function": "0x10323300", "site": "0x10323151"},
+      {"name": "AscSpellMods::AuraFlagOn", "function": "0x10325aa0", "site": "0x10324d9a"},
+      {"name": "AscAppearance::BeforeAuraApply", "function": "0x100c6410", "site": "0x100c5b88"},
+      {"name": "AscSpawnVisibility::BeforeAuraApply", "function": "0x101a1fa0", "site": "0x101a2025"},
+      {"name": "(original-only, not reconstructed)", "function": null, "site": null,
+       "note": "Called last. Registered by the original's runtime layer, no static registration site."}
+    ]
+  },
+  "EffectFilter": {
+    "object": "0x10be2d78",
+    "callbacks": [
+      {"name": "AscSpellVisuals::RemoveEffect", "function": "0x10323480", "site": "0x1032313d"},
+      {"name": "AscQuestSpellHide::RemoveEffect", "function": "0x10112650", "site": "0x10112625"}
+    ]
+  },
+  "VisualHide": {
+    "object": "0x10be2d98",
+    "callbacks": [
+      {"name": "AscSpellVisuals::HideVisual", "function": "0x10323410", "site": "0x10323147"},
+      {"name": "AscQuestSpellHide::HideVisual", "function": "0x10112640", "site": "0x1011262f"}
     ]
   }
 }
