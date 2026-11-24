@@ -159,13 +159,25 @@ namespace
                            *reinterpret_cast<const uint32_t*>(0xD3F7D4), Buttons().Count());
         }
         Tick();
-        AscRuntime::Schedule(100, OnTimer, nullptr);
+        // Keep the re-armed handle so Stop/Start can cancel the live timer, not only the first one.
+        g_timer = AscRuntime::Schedule(100, OnTimer, nullptr);
         return 0;
     }
 
-    // 0x10236b00
+    void CancelTimer()
+    {
+        if (g_timer)
+        {
+            AscRuntime::Cancel(g_timer, OnTimer, nullptr);
+            g_timer = 0;
+        }
+    }
+
+    // 0x10236b00. EnterWorld repeats on /reload and far teleports: cancel the running chain
+    // first so world entries do not stack 100 ms ticks.
     void Start()
     {
+        CancelTimer();
         g_timer = AscRuntime::Schedule(100, OnTimer, nullptr);
     }
 
@@ -173,11 +185,7 @@ namespace
     void Stop()
     {
         g_active.clear();
-        if (g_timer)
-        {
-            AscRuntime::Cancel(g_timer, OnTimer, nullptr);
-            g_timer = 0;
-        }
+        CancelTimer();
     }
 
     // handler_GetExtraActionButtonInfo: row -> (str +8, str +0xC, int +4, str +0x10), else four nils.

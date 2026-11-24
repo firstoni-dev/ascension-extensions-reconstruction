@@ -152,20 +152,32 @@ namespace
     int __cdecl OnTimer(void*)
     {
         Tick();
-        AscRuntime::Schedule(100, OnTimer, nullptr);
+        // Keep the re-armed handle so Stop/Start can cancel the live timer, not only the first one.
+        g_timer = AscRuntime::Schedule(100, OnTimer, nullptr);
         return 0;
     }
 
-    void Start() { g_timer = AscRuntime::Schedule(100, OnTimer, nullptr); }   // 0x1031f940
-
-    void Stop()                                                                // 0x1031f860
+    void CancelTimer()
     {
-        g_shown.clear();
         if (g_timer)
         {
             AscRuntime::Cancel(g_timer, OnTimer, nullptr);
             g_timer = 0;
         }
+    }
+
+    // 0x1031f940. EnterWorld fires again on every /reload and far teleport without a glue screen
+    // in between: cancel the running chain first or each world entry stacks another 100 ms tick.
+    void Start()
+    {
+        CancelTimer();
+        g_timer = AscRuntime::Schedule(100, OnTimer, nullptr);
+    }
+
+    void Stop()                                                                // 0x1031f860
+    {
+        g_shown.clear();
+        CancelTimer();
     }
 
     // handler_GetSpellActivationOverlayInfo: 8 values, the last nil when the dword at +0x28 is 0.

@@ -131,8 +131,15 @@ namespace
         return 0;
     }
 
-    void OnEnterWorld()   // FUN_1033b820
+    // FUN_1033b820. EnterWorld repeats on /reload and far teleports: cancel the running chain
+    // before re-arming so world entries do not stack ticks.
+    void OnEnterWorld()
     {
+        if (g_timer)
+        {
+            AscRuntime::Cancel(g_timer, OnTick, nullptr);
+            g_timer = 0;
+        }
         g_timer = AscRuntime::Schedule(0x32, OnTick, nullptr);
     }
 

@@ -291,13 +291,13 @@ namespace
     int __cdecl OpcodeTimer(void*)   // LAB_102d5cb0
     {
         DumpOpcodes();
-        AscRuntime::Schedule(5000, &OpcodeTimer, nullptr);
+        g_opcodeTimer = AscRuntime::Schedule(5000, &OpcodeTimer, nullptr);
         return 0;
     }
     int __cdecl EventTimer(void*)    // LAB_102d5cd0
     {
         DumpEvents();
-        AscRuntime::Schedule(5000, &EventTimer, nullptr);
+        g_eventTimer = AscRuntime::Schedule(5000, &EventTimer, nullptr);
         return 0;
     }
 
