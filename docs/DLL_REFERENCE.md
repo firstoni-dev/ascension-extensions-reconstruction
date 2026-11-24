@@ -4860,9 +4860,9 @@ C_ExtraActionButton -- transcribed from the original's subsystem at 0x10236840..
 
 | Binding | State | Args → returns | Original | Implementation | Notes |
 |---|---|---|---|---|---|
-| `C_ExtraActionButton.GetExtraActionButtonInfo` | world | (number) → 0..4 | `0x10236B90` | AscExtraActionButton.cpp:184 `GetExtraActionButtonInfo` | handler_GetExtraActionButtonInfo: row -> (str +8, str +0xC, int +4, str +0x10), else four nils. |
-| `C_ExtraActionButton.GetNumExtraActionButtons` | world | () → 1 | `0x10236C70` | AscExtraActionButton.cpp:215 `GetNumExtraActionButtons` | handler_GetNumExtraActionButtons |
-| `C_ExtraActionButton.GetExtraActionButtonAtIndex` | world | (number) → 0..1 | `0x10236B20` | AscExtraActionButton.cpp:202 `GetExtraActionButtonAtIndex` | handler_GetExtraActionButtonAtIndex: 1-based; nil for an out-of-range index or a zero id, and nothing at all for index 0. |
+| `C_ExtraActionButton.GetExtraActionButtonInfo` | world | (number) → 0..4 | `0x10236B90` | AscExtraActionButton.cpp:192 `GetExtraActionButtonInfo` | handler_GetExtraActionButtonInfo: row -> (str +8, str +0xC, int +4, str +0x10), else four nils. |
+| `C_ExtraActionButton.GetNumExtraActionButtons` | world | () → 1 | `0x10236C70` | AscExtraActionButton.cpp:223 `GetNumExtraActionButtons` | handler_GetNumExtraActionButtons |
+| `C_ExtraActionButton.GetExtraActionButtonAtIndex` | world | (number) → 0..1 | `0x10236B20` | AscExtraActionButton.cpp:210 `GetExtraActionButtonAtIndex` | handler_GetExtraActionButtonAtIndex: 1-based; nil for an out-of-range index or a zero id, and nothing at all for index 0. |
 
 **Events fired:** `EXTRA_ACTION_BUTTON_ADDED`, `EXTRA_ACTION_BUTTON_REMOVED`
 
@@ -6892,8 +6892,8 @@ C_SpellActivationOverlay -- transcribed from the original's subsystem at 0x1031f
 
 | Binding | State | Args → returns | Original | Implementation | Notes |
 |---|---|---|---|---|---|
-| `C_SpellActivationOverlay.GetSpellActivationOverlayInfo` | world | (number) → 0..8 | `0x1031F960` | AscSpellActivationOverlay.cpp:172 `GetSpellActivationOverlayInfo` | handler_GetSpellActivationOverlayInfo: 8 values, the last nil when the dword at +0x28 is 0. |
-| `C_SpellActivationOverlay.IsSpellOverlayed` | world | (number) → 0..1 | `0x1031FAC0` | AscSpellActivationOverlay.cpp:196 `IsSpellOverlayed` | handler_IsSpellOverlayed: is any shown overlay's spell (+0x1C) the same first rank as arg 1. |
+| `C_SpellActivationOverlay.GetSpellActivationOverlayInfo` | world | (number) → 0..8 | `0x1031F960` | AscSpellActivationOverlay.cpp:184 `GetSpellActivationOverlayInfo` | handler_GetSpellActivationOverlayInfo: 8 values, the last nil when the dword at +0x28 is 0. |
+| `C_SpellActivationOverlay.IsSpellOverlayed` | world | (number) → 0..1 | `0x1031FAC0` | AscSpellActivationOverlay.cpp:208 `IsSpellOverlayed` | handler_IsSpellOverlayed: is any shown overlay's spell (+0x1C) the same first rank as arg 1. |
 
 **Events fired:** `HIDE_SPELL_ACTIVATION_OVERLAY`, `SHOW_SPELL_ACTIVATION_OVERLAY`
 
@@ -7073,15 +7073,15 @@ C_SuperTrack. The tracker is the static at 0x10BCC640: +0 quest id, then the tar
 
 | Binding | State | Args → returns | Original | Implementation | Notes |
 |---|---|---|---|---|---|
-| `C_SuperTrack.ClearSuperTracker` | world | () → 0 | `0x10335130` | AscSuperTrack.cpp:434 `ClearSuperTracker` |  |
-| `C_SuperTrack.IsSuperTrackingAnything` | world | () → 1 | `0x103353D0` | AscSuperTrack.cpp:441 `IsSuperTrackingAnything` |  |
-| `C_SuperTrack.GetTargetState` | world | () → 1 | `0x103353B0` | AscSuperTrack.cpp:455 `GetTargetState` |  |
-| `C_SuperTrack.GetSuperTrackedWorldPosition` | world | () → 1..4 | `0x10335280` | AscSuperTrack.cpp:461 `GetSuperTrackedWorldPosition` |  |
-| `C_SuperTrack.GetSuperTrackedPosition` | world | () → 1..3 | `0x10335170` | AscSuperTrack.cpp:486 `GetSuperTrackedPosition` | FUN_102179e0: world -> screen through the world frame *(0xB7436C) (0x4F6D20), then the client's coordinate conversions 0x493D70 / 0x493E00. |
-| `C_SuperTrack.SetSuperTrackedPosition` | world | (number, number, number, number) → 0 | `0x10335FB0` | AscSuperTrack.cpp:511 `SetSuperTrackedPosition` | FUN_10335fb0: (x, y, z, map); radius 5.5. |
-| `C_SuperTrack.SetSuperTrackedCorpse` | world | (bool) → 0 | `0x10335EB0` | AscSuperTrack.cpp:527 `SetSuperTrackedCorpse` | FUN_10335eb0: the current map (0xBD088C) and the position at 0xBD0A58. |
-| `C_SuperTrack.SetSuperTrackedQuestID` | world | (number) → 0 | `0x10336140` | AscSuperTrack.cpp:394 `SetSuperTrackedQuestID` | FUN_10336140: (questID) -- tracker cleared to the quest, its target resolved, event fired. |
-| `C_SuperTrack.PositionFrame` | world | (bool) → 0 | `0x10335400` | AscSuperTrack.cpp:411 `PositionFrame` | FUN_10335400: PositionFrame(bool). true: client flag 0xD3F798 = 0 and the two x87 blocks at 0x49DDBF (0x1C bytes) and 0x49DDE5 (0x1F) become NOPs; false: flag = 1 and the stock bytes go back. (The original writes through a hash-resolved NtProtectVirtualMemory, RWX then restore.) |
+| `C_SuperTrack.ClearSuperTracker` | world | () → 0 | `0x10335130` | AscSuperTrack.cpp:437 `ClearSuperTracker` |  |
+| `C_SuperTrack.IsSuperTrackingAnything` | world | () → 1 | `0x103353D0` | AscSuperTrack.cpp:444 `IsSuperTrackingAnything` |  |
+| `C_SuperTrack.GetTargetState` | world | () → 1 | `0x103353B0` | AscSuperTrack.cpp:458 `GetTargetState` |  |
+| `C_SuperTrack.GetSuperTrackedWorldPosition` | world | () → 1..4 | `0x10335280` | AscSuperTrack.cpp:464 `GetSuperTrackedWorldPosition` |  |
+| `C_SuperTrack.GetSuperTrackedPosition` | world | () → 1..3 | `0x10335170` | AscSuperTrack.cpp:489 `GetSuperTrackedPosition` | FUN_102179e0: world -> screen through the world frame *(0xB7436C) (0x4F6D20), then the client's coordinate conversions 0x493D70 / 0x493E00. |
+| `C_SuperTrack.SetSuperTrackedPosition` | world | (number, number, number, number) → 0 | `0x10335FB0` | AscSuperTrack.cpp:514 `SetSuperTrackedPosition` | FUN_10335fb0: (x, y, z, map); radius 5.5. |
+| `C_SuperTrack.SetSuperTrackedCorpse` | world | (bool) → 0 | `0x10335EB0` | AscSuperTrack.cpp:530 `SetSuperTrackedCorpse` | FUN_10335eb0: the current map (0xBD088C) and the position at 0xBD0A58. |
+| `C_SuperTrack.SetSuperTrackedQuestID` | world | (number) → 0 | `0x10336140` | AscSuperTrack.cpp:397 `SetSuperTrackedQuestID` | FUN_10336140: (questID) -- tracker cleared to the quest, its target resolved, event fired. |
+| `C_SuperTrack.PositionFrame` | world | (bool) → 0 | `0x10335400` | AscSuperTrack.cpp:414 `PositionFrame` | FUN_10335400: PositionFrame(bool). true: client flag 0xD3F798 = 0 and the two x87 blocks at 0x49DDBF (0x1C bytes) and 0x49DDE5 (0x1F) become NOPs; false: flag = 1 and the stock bytes go back. (The original writes through a hash-resolved NtProtectVirtualMemory, RWX then restore.) |
 
 **Server packets handled**
 
@@ -7123,22 +7123,22 @@ C_TemporalContracts (TemporalContractMgr, static 0x10D3C1F0 via FUN_10339160), t
 
 | Binding | State | Args → returns | Original | Implementation | Notes |
 |---|---|---|---|---|---|
-| `C_TemporalContracts.GetCompletableTemporalContracts` | world | () → 1 | `0x10339FF0` | AscTemporalContracts.cpp:264 `GetCompletableTemporalContracts` | ---- bindings ------------------------------------------------------------------------------------- FUN_10339ff0: {[Name] = {remainingCompletions, moneyCost, tokenCost, minimumLevel, name, quests}} for every type with completions left and both costs set. |
-| `C_TemporalContracts.ActivateTemporalContract` | world | (bool, number) → 1 | `0x103396A0` | AscTemporalContracts.cpp:289 `ActivateTemporalContract` | FUN_103396a0: (type, flag [, count]) -- queued only while nothing else is pending. |
-| `C_TemporalContracts.GetTemporalContractInfo` | world | () → 1 | `0x1033A780` | AscTemporalContracts.cpp:307 `GetTemporalContractInfo` | FUN_1033a780: (type) -> {remainingCompletions, moneyCost, tokenCost, quests}, zeros when unknown. |
-| `C_TemporalContracts.GetCompletableQuestsByCategory` | world | () → 1 | `0x10339D90` | AscTemporalContracts.cpp:327 `GetCompletableQuestsByCategory` | FUN_10339d90: (type) -> the type's quest ids, or nil. |
-| `C_TemporalContracts.GetQuestCategory` | world | () → 1 | `0x1033A280` | AscTemporalContracts.cpp:352 `GetQuestCategory` | handler_GetQuestCategory (0x1033a280): (quest) -> the built-in category, else the first type owning one of the quest's groups, else nil. |
-| `C_TemporalContracts.GetTemporalContractTypes` | world | () → 1 | `0x1033AA80` | AscTemporalContracts.cpp:377 `GetTemporalContractTypes` | FUN_1033aa80: {[content type] = {type names...}}. |
-| `C_TemporalContracts.ActivateAllTemporalContracts` | world | (bool) → 1 | `0x10339510` | AscTemporalContracts.cpp:416 `ActivateAllTemporalContracts` | handler_ActivateAllTemporalContracts (0x10339510): (flag) over the whole Callboard view. |
-| `C_TemporalContracts.ActivateAllTemporalContractsByContentType` | world | (bool) → 1 | `0x103395A0` | AscTemporalContracts.cpp:429 `ActivateAllTemporalContractsByContentType` | FUN_103395a0: (content type, flag). |
-| `C_TemporalContracts.GetCategoryData` | world | () → 1 | `0x10339800` | AscTemporalContracts.cpp:444 `GetCategoryData` | FUN_10339800: (type) -> {rewards (the first cached quest's, unscaled by completions), remainingCompletions, category, moneyCost, tokenCost, minimumLevel, name}, or nil. |
-| `C_TemporalContracts.GetCategoryName` | world | () → 1 | `0x10339CB0` | AscTemporalContracts.cpp:499 `GetCategoryName` | FUN_10339cb0: (type) -> its display name, or nil. |
-| `C_TemporalContracts.GetTotalContentTypeRewards` | world | () → 1 | `0x1033AE00` | AscTemporalContracts.cpp:515 `GetTotalContentTypeRewards` | FUN_1033ae00: (content type) -> the rewards of every remaining completion of its priced types, one cached quest per group. |
-| `C_TemporalContracts.GetTotalContractTypeRewards` | world | () → 1 | `0x1033B410` | AscTemporalContracts.cpp:534 `GetTotalContractTypeRewards` | FUN_1033b410: (type) -> its first cached quest's rewards times the remaining completions, or nil. |
-| `C_TemporalContracts.GetTotalContentTypeCost` | world | () → 1 | `0x1033AC60` | AscTemporalContracts.cpp:553 `GetTotalContentTypeCost` | FUN_1033ac60: (content type) -> {moneyCost, tokenCost} over its priced types' completions. |
-| `C_TemporalContracts.GetTotalContractTypeCost` | world | () → 1 | `0x1033B2E0` | AscTemporalContracts.cpp:575 `GetTotalContractTypeCost` | FUN_1033b2e0: (type) -> {moneyCost, tokenCost} for its remaining completions, zeros when unknown. |
-| `C_TemporalContracts.GetQuestSortIDs` | world | (number, ascscript::boolean) → 0..1 | `0x1033A3B0` | AscTemporalContracts.cpp:598 `GetQuestSortIDs` | FUN_1033a3b0: (quest, includeZone) -> [the cached quest's ZoneOrSort when asked and set,] then the Quest.dbc row's non-zero sort ids (+0x68..+0x70). Nothing while either record is missing. |
-| `C_TemporalContracts.GetQuestSortText` | world | (number) → 0..1 | `0x1033A5F0` | AscTemporalContracts.cpp:627 `GetQuestSortText` | FUN_1033a5f0: (sort) -> AreaTable name (+0x2C) for a positive id, QuestSort name (+4) for a negative one, else "Unknown". |
+| `C_TemporalContracts.GetCompletableTemporalContracts` | world | () → 1 | `0x10339FF0` | AscTemporalContracts.cpp:271 `GetCompletableTemporalContracts` | ---- bindings ------------------------------------------------------------------------------------- FUN_10339ff0: {[Name] = {remainingCompletions, moneyCost, tokenCost, minimumLevel, name, quests}} for every type with completions left and both costs set. |
+| `C_TemporalContracts.ActivateTemporalContract` | world | (bool, number) → 1 | `0x103396A0` | AscTemporalContracts.cpp:296 `ActivateTemporalContract` | FUN_103396a0: (type, flag [, count]) -- queued only while nothing else is pending. |
+| `C_TemporalContracts.GetTemporalContractInfo` | world | () → 1 | `0x1033A780` | AscTemporalContracts.cpp:314 `GetTemporalContractInfo` | FUN_1033a780: (type) -> {remainingCompletions, moneyCost, tokenCost, quests}, zeros when unknown. |
+| `C_TemporalContracts.GetCompletableQuestsByCategory` | world | () → 1 | `0x10339D90` | AscTemporalContracts.cpp:334 `GetCompletableQuestsByCategory` | FUN_10339d90: (type) -> the type's quest ids, or nil. |
+| `C_TemporalContracts.GetQuestCategory` | world | () → 1 | `0x1033A280` | AscTemporalContracts.cpp:359 `GetQuestCategory` | handler_GetQuestCategory (0x1033a280): (quest) -> the built-in category, else the first type owning one of the quest's groups, else nil. |
+| `C_TemporalContracts.GetTemporalContractTypes` | world | () → 1 | `0x1033AA80` | AscTemporalContracts.cpp:384 `GetTemporalContractTypes` | FUN_1033aa80: {[content type] = {type names...}}. |
+| `C_TemporalContracts.ActivateAllTemporalContracts` | world | (bool) → 1 | `0x10339510` | AscTemporalContracts.cpp:423 `ActivateAllTemporalContracts` | handler_ActivateAllTemporalContracts (0x10339510): (flag) over the whole Callboard view. |
+| `C_TemporalContracts.ActivateAllTemporalContractsByContentType` | world | (bool) → 1 | `0x103395A0` | AscTemporalContracts.cpp:436 `ActivateAllTemporalContractsByContentType` | FUN_103395a0: (content type, flag). |
+| `C_TemporalContracts.GetCategoryData` | world | () → 1 | `0x10339800` | AscTemporalContracts.cpp:451 `GetCategoryData` | FUN_10339800: (type) -> {rewards (the first cached quest's, unscaled by completions), remainingCompletions, category, moneyCost, tokenCost, minimumLevel, name}, or nil. |
+| `C_TemporalContracts.GetCategoryName` | world | () → 1 | `0x10339CB0` | AscTemporalContracts.cpp:506 `GetCategoryName` | FUN_10339cb0: (type) -> its display name, or nil. |
+| `C_TemporalContracts.GetTotalContentTypeRewards` | world | () → 1 | `0x1033AE00` | AscTemporalContracts.cpp:522 `GetTotalContentTypeRewards` | FUN_1033ae00: (content type) -> the rewards of every remaining completion of its priced types, one cached quest per group. |
+| `C_TemporalContracts.GetTotalContractTypeRewards` | world | () → 1 | `0x1033B410` | AscTemporalContracts.cpp:541 `GetTotalContractTypeRewards` | FUN_1033b410: (type) -> its first cached quest's rewards times the remaining completions, or nil. |
+| `C_TemporalContracts.GetTotalContentTypeCost` | world | () → 1 | `0x1033AC60` | AscTemporalContracts.cpp:560 `GetTotalContentTypeCost` | FUN_1033ac60: (content type) -> {moneyCost, tokenCost} over its priced types' completions. |
+| `C_TemporalContracts.GetTotalContractTypeCost` | world | () → 1 | `0x1033B2E0` | AscTemporalContracts.cpp:582 `GetTotalContractTypeCost` | FUN_1033b2e0: (type) -> {moneyCost, tokenCost} for its remaining completions, zeros when unknown. |
+| `C_TemporalContracts.GetQuestSortIDs` | world | (number, ascscript::boolean) → 0..1 | `0x1033A3B0` | AscTemporalContracts.cpp:605 `GetQuestSortIDs` | FUN_1033a3b0: (quest, includeZone) -> [the cached quest's ZoneOrSort when asked and set,] then the Quest.dbc row's non-zero sort ids (+0x68..+0x70). Nothing while either record is missing. |
+| `C_TemporalContracts.GetQuestSortText` | world | (number) → 0..1 | `0x1033A5F0` | AscTemporalContracts.cpp:634 `GetQuestSortText` | FUN_1033a5f0: (sort) -> AreaTable name (+0x2C) for a positive id, QuestSort name (+4) for a negative one, else "Unknown". |
 
 **Client packets sent:** `0x55B` CMSG_ACTIVATE_TEMPORAL_CONTRACT
 
