@@ -366,8 +366,11 @@ namespace
         g_lastQuest = 0;
     }
 
-    void OnEnterWorld()   // 0x103362A0 (FUN_10278510): the three timers
+    // 0x103362A0 (FUN_10278510): the three timers. EnterWorld repeats on /reload and far
+    // teleports without a glue screen in between, so cancel the running chains before re-arming.
+    void OnEnterWorld()
     {
+        StopTimers();
         g_timers[0] = AscRuntime::Schedule(1000, ResolveTick, nullptr);
         g_timers[1] = AscRuntime::Schedule(100, ArrivalTick, nullptr);
         g_timers[2] = AscRuntime::Schedule(1000, QuestChangeTick, nullptr);
