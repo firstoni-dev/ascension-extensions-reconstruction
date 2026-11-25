@@ -7,9 +7,12 @@
 // 25 ints, count 0xC23AD4) are too small for 64 quests and their zone headers; the list below holds 128 rows and 64
 // sort types (as CoA64 sizes them). Three techniques: functions with list logic or descriptor slot walks are ported;
 // functions that only index the list get their operands pointed at the DLL list (kOperandPatches); the four
-// leaderboard functions also get their one descriptor read replaced by a call (kSlotSites). The quest watch and POI
-// functions (Tasks 11 and 12) still read the old arrays, so after every write the first 50 rows and 25 sort types are
-// copied back there with the counts clamped (Mirror); those readers miss only rows 50+. See Sync for the list.
+// leaderboard functions also get their one descriptor read replaced by a call (kSlotSites). The POI functions
+// (Task 12) and three DLL readers (Task 13) still read the old arrays, so after every write the first 50 rows and 25
+// sort types are copied back there with the counts clamped (Mirror); those readers miss only rows 50+. See Sync.
+//
+// The watches (Task 11). CGQuestLog::m_questWatches (0xC23680, 25 x 12 bytes) moves to s_watches (64) by the same
+// operand patches, applied to the watch functions as one group; the timer Lua functions are ported.
 //
 // The 25-bit collapse filter (cvar questLogCollapseFilter) is unchanged (spec non-goal): sort types past the 25th
 // have no collapse bit and always show expanded.
@@ -186,6 +189,46 @@ namespace AscQuestLog64List
         return original == 0xC23AD0 ? count : rows + (original - 0xC237B0);
     }
 
+    // CGQuestLog::m_questWatches entry (0xC23680, 25 of them, count 0xC23AE0); the DLL keeps 64 (CoA64 m_questWatches).
+    struct Watch
+    {
+        int32_t questId;
+        int32_t expireTime;   // 0: no timeout
+        float distance;       // SortQuestWatches
+    };
+    static_assert(sizeof(Watch) == 12, "CGQuestLog::m_questWatches entry");
+
+    // An operand that addressed the old watch array, pointed at the DLL's: 0xC23680 + k -> `watches` + k. k may be
+    // negative: RemoveQuestWatch writes the last entry as 0xC23674/0xC23678[count * 12].
+    uint32_t RelocatedWatch(uint32_t original, uint32_t watches) { return watches + (original - 0xC23680); }
+
+    // `cmp r32, imm8` bounds, each given as its 3 bytes little-endian (83 modrm imm8; modrm F8+r is cmp r32). 0 when
+    // the bytes are not of that form.
+    // A 50-row walk `cmp r32, 32h` -> `cmp r8, 80h` (128 rows; 80 modrm imm8 is cmp r8, so r must be eax..ebx). The
+    // sites count up from 0 by 1 and branch with jb, so the unsigned byte compare is exact for 0..128.
+    uint32_t RowBound(uint32_t original)
+    {
+        const uint32_t modrm = (original >> 8) & 0xFF;
+        if ((original & 0xFF) != 0x83 || (modrm & 0xF8) != 0xF8 || (modrm & 7) > 3 || (original >> 16) != 0x32)
+            return 0;
+        return 0x800080 | (modrm << 8);
+    }
+    // A 25-watch bound `cmp r32, 19h` -> `cmp r32, 40h` (64 watches; still a positive imm8).
+    uint32_t WatchBound(uint32_t original)
+    {
+        const uint32_t modrm = (original >> 8) & 0xFF;
+        if ((original & 0xFF) != 0x83 || (modrm & 0xF8) != 0xF8 || (original >> 16) != 0x19)
+            return 0;
+        return 0x400083 | (modrm << 8);
+    }
+
+    // Seconds a timed quest has left, as GetQuestTimers / GetQuestIndexForTimer compute them (negative: expired);
+    // 32-bit wrapping like the original's add/sub.
+    int32_t TimerLeft(int32_t timeOffset, uint32_t entryTime, int32_t now)
+    {
+        return static_cast<int32_t>(static_cast<uint32_t>(timeOffset) + entryTime - static_cast<uint32_t>(now) - 1u);
+    }
+
     enum X86Reg : uint8_t { kEax = 0, kEcx = 1, kEdx = 2, kEbx = 3, kEsi = 6, kEdi = 7 };
 
     // The code replacing a slot site at `start` (`size` bytes, filled with nops after it):
@@ -238,7 +281,14 @@ namespace
     uint8_t& TrackedLoaded() { return *reinterpret_cast<uint8_t*>(0xC23AF0); }           // m_trackedQuestsLoaded
     uint32_t& CallbackCount() { return *reinterpret_cast<uint32_t*>(0xC23AF4); }         // s_questCallbackCount
     int32_t& NextQuestUpdate() { return *reinterpret_cast<int32_t*>(0xC23AF8); }         // m_nextQuestUpdate
-    int32_t WatchQuest(uint32_t i) { return *reinterpret_cast<int32_t*>(0xC23680 + i * 12); }   // m_questWatches[i]
+    // m_questWatches (0xC23680, 25 entries) moves to s_watches (64) once every watch function is patched
+    // (PatchOperands); until then (bytes not matching) the client array stays in use.
+    Watch s_watches[AscQuestLog64::kMaxSlots] = {};
+    bool s_watchesRelocated = false;
+    int32_t WatchQuest(uint32_t i)
+    {
+        return s_watchesRelocated ? s_watches[i].questId : *reinterpret_cast<int32_t*>(0xC23680 + i * 12);
+    }
     uint8_t* CollapseCVar() { return *reinterpret_cast<uint8_t**>(0xBD0A34); }           // s_cvQuestLogCollapseFilter
     int32_t CollapseFilter() { return *reinterpret_cast<int32_t*>(CollapseCVar() + 0x30); }
 
@@ -311,10 +361,10 @@ namespace
     uint16_t EntryCount(const uint8_t* e, uint32_t i) { return *reinterpret_cast<const uint16_t*>(e + 8 + i * 2); }
     uint32_t EntryTime(const uint8_t* e) { return *reinterpret_cast<const uint32_t*>(e + 16); }
 
-    // The copy back into m_quests / m_sortTypes, for the readers not yet replaced: Task 11 (0x5DF610, 0x5DF700,
-    // 0x5DF780, 0x5DFC40, 0x5E64D0, 0x5E67C0, 0x5E6240, 0x5E4FB0) and Task 12 (0x5E2B60, 0x5E2EB0,
+    // The copy back into m_quests / m_sortTypes, for the readers not yet replaced: Task 12 (0x5E2B60, 0x5E2EB0,
     // 0x5E3840, 0x5E6650), and the DLL's own readers of 0xC237B0 / 0xC23AD0 (Task 13): AscAttachFixes QuestRelevant,
-    // AscSmallApis ForOpenLoggedQuest and AscQuestSpellHide HiddenSpell. Remove once they are.
+    // AscSmallApis ForOpenLoggedQuest and AscQuestSpellHide HiddenSpell. Also the watch functions (Task 11), but only
+    // when their bytes did not match and they were left unpatched. Remove once all of them are replaced.
     void Sync() { Mirror(s_list, NativeRows(), NativeCount(), NativeSortTypes(), NativeNumSortTypes()); }
 
     const Row* QuestRow(int32_t index)
@@ -740,6 +790,7 @@ namespace
     {
         const int r = g_initializeGame();
         s_list = {};
+        memset(s_watches, 0, sizeof(s_watches));   // the original zeroes m_questWatches and its count
         return r;
     }
 
@@ -884,6 +935,87 @@ namespace
         return 1;
     }
 
+    // ---- quest timers (Task 11) ----------------------------------------------------------------------------------
+
+    // The running timed quest at list row `i`: its log entry, or nullptr (header, slot outside 0..63, no timer, failed).
+    const uint8_t* TimedEntry(uint8_t* player, uint32_t i)
+    {
+        if (i >= s_list.count || s_list.rows[i].isHeader)
+            return nullptr;
+        const int32_t slot = s_list.rows[i].logSlot;
+        if (slot < 0 || slot >= static_cast<int32_t>(kMaxSlots))
+            return nullptr;
+        const uint8_t* entry = LogEntry(player, static_cast<uint32_t>(slot));
+        return entry && EntryTime(entry) && !(EntryState(entry) & 2) ? entry : nullptr;
+    }
+
+    // 0x5E6240 Script_GetQuestTimers: the seconds left of each running timed quest, in list order. A quest whose
+    // time ran out is marked expired, announced (CGGameUI::DisplayError ERR_QUEST_FAILED_S) and signalled once.
+    // Returns 0 with nothing pushed when there is no player.
+    int __cdecl Script_GetQuestTimers(lua_State* L)
+    {
+        uint8_t* player = Player();
+        if (!player)
+            return 0;
+        const uint32_t numQuest = s_list.count;
+        const int32_t timeOffset = TimeOffset();
+        int count = 0;
+        bool failed = false;
+        for (uint32_t i = 0; i < numQuest; ++i)
+        {
+            const uint8_t* entry = TimedEntry(player, i);
+            if (!entry || s_list.rows[i].expired)
+                continue;
+            const int32_t left = TimerLeft(timeOffset, EntryTime(entry), static_cast<int32_t>(::time(nullptr)));
+            if (left < 0)
+            {
+                if (SetQuestExpired(i))
+                {
+                    if (const uint8_t* q = Quest(static_cast<int32_t>(EntryQuest(entry)), 0x5DE980))   // DisplayQuestFailed
+                        reinterpret_cast<void(__cdecl*)(int, const char*)>(0x5216F0)(0x94, reinterpret_cast<const char*>(q + kQName));
+                    failed = true;
+                }
+            }
+            else
+            {
+                ++count;
+                lua_checkstack(L, 1);
+                lua_pushnumber(L, left);
+            }
+        }
+        if (failed)
+            Signal(kQuestLogUpdate);
+        return count;
+    }
+
+    // 0x5E4FB0 Script_GetQuestIndexForTimer(n): the list index (1-based) of the n-th running timed quest, nil if none.
+    int __cdecl Script_GetQuestIndexForTimer(lua_State* L)
+    {
+        if (!lua_isnumber(L, 1))
+            luaL_error(L, "Usage: GetQuestIndexForTimer(index)");
+        const int32_t index = static_cast<int32_t>(static_cast<int64_t>(lua_tonumber(L, 1))) - 1;
+        if (uint8_t* player = Player())
+        {
+            const uint32_t numQuest = s_list.count;
+            const int32_t timeOffset = TimeOffset();
+            int32_t found = 0;
+            for (uint32_t i = 0; i < numQuest; ++i)
+            {
+                const uint8_t* entry = TimedEntry(player, i);
+                if (!entry || TimerLeft(timeOffset, EntryTime(entry), static_cast<int32_t>(::time(nullptr))) < 0)
+                    continue;
+                if (found == index)
+                {
+                    lua_pushnumber(L, i + 1);
+                    return 1;
+                }
+                ++found;
+            }
+        }
+        lua_pushnil(L);
+        return 1;
+    }
+
     // ---- operand patches: client functions that only index the list ------------------------------------------
     //
     // Instead of a port, every operand that addresses the old list is pointed at the DLL list: m_quests row
@@ -893,20 +1025,25 @@ namespace
     // selection globals (0xC23AD8, 0xC23ADC) are not relocated. Each function's patches are applied only when every
     // original operand matches; otherwise the function is left alone (it then reads the mirror) and the log says so.
     // Table generated from IDA (2026-11-25); see the task 10 report.
-    enum OperandKind : uint8_t { kRows, kCount, kBound };
+    //
+    // Task 11 moves the watch array the same way: every operand 0xC23680 + k (m_questWatches, 12-byte entries; k from
+    // -12) -> s_watches + k, and each `cmp r, 19h` bounding a watch index -> `cmp r, 40h` (64). The count 0xC23AE0
+    // stays where it is. The watch functions are one group, patched all or nothing (PatchOperands), so the array
+    // never lives in two places.
+    enum OperandKind : uint8_t { kRows, kCount, kBound, kWatches, kWatchBound };
     struct OperandPatch
     {
         uint32_t function;
-        uint32_t at;         // the operand's 4 bytes (kRows, kCount); the instruction (kBound)
-        uint32_t original;   // the operand's value (kBound: unused)
+        uint32_t at;         // the operand's 4 bytes (kRows, kCount, kWatches); the instruction (kBound, kWatchBound)
+        uint32_t original;   // the operand's value; for a bound, the instruction's 3 bytes little-endian
         OperandKind kind;
     };
     const OperandPatch kOperandPatches[] = {
         {0x5E1460, 0x5E150E, 0xC237B4, kRows},    // GetQuestLeaderBoardByID: mov edi, m_quests[].logSlot
         {0x5E1460, 0x5E1A3B, 0xC237B0, kRows},    //   mov ecx, offset m_quests
-        {0x5E1460, 0x5E1A54, 0, kBound},          //   cmp eax, 32h
+        {0x5E1460, 0x5E1A54, 0x32F883, kBound},   //   cmp eax, 32h
         {0x5E1460, 0x5E1F37, 0xC237B0, kRows},    //   mov ecx, offset m_quests
-        {0x5E1460, 0x5E1F54, 0, kBound},          //   cmp eax, 32h
+        {0x5E1460, 0x5E1F54, 0x32F883, kBound},   //   cmp eax, 32h
         {0x5E20A0, 0x5E2147, 0xC237B4, kRows},    // GetQuestLogItemDropByID: mov esi, m_quests[].logSlot
         {0x5E2370, 0x5E2401, 0xC23AD0, kCount},   // GetQuestLeaderBoardForObject
         {0x5E2370, 0x5E240C, 0xC237B8, kRows},
@@ -915,7 +1052,7 @@ namespace
         {0x5E2630, 0x5E26CC, 0xC237B8, kRows},
         {0x5E2630, 0x5E26D5, 0xC237B4, kRows},
         {0x5E1300, 0x5E1423, 0xC237B0, kRows},    // GetNumQuestLeaderBoards: mov ecx, offset m_quests
-        {0x5E1300, 0x5E1439, 0, kBound},          //   cmp eax, 32h
+        {0x5E1300, 0x5E1439, 0x32F883, kBound},   //   cmp eax, 32h
         {0x5E0DA0, 0x5E0DAB, 0xC23AD0, kCount},   // GetQuestSpecialItem
         {0x5E0DA0, 0x5E0DBD, 0xC237B8, kRows},
         {0x5E0DA0, 0x5E0DC9, 0xC237B0, kRows},
@@ -957,14 +1094,61 @@ namespace
         {0x626720, 0x626AD2, 0xC23AD0, kCount},   // CGTooltip::SetObject (then GetQuestAt, ported)
         {0x626720, 0x626D43, 0xC23AD0, kCount},
         {0x5E2950, 0x5E2963, 0xC237B0, kRows},    // ComputeBlobQuestObjectives: mov ecx, offset m_quests
-        {0x5E2950, 0x5E2976, 0, kBound},          //   cmp eax, 32h
+        {0x5E2950, 0x5E2976, 0x32F883, kBound},   //   cmp eax, 32h
         {0x5E2950, 0x5E2982, 0xC23AD0, kCount},
         {0x5E2950, 0x5E2992, 0xC237B8, kRows},
         {0x5E2950, 0x5E29CD, 0xC237B4, kRows},    //   then GetQuestLogEntry (0x5E0870, replaced)
         {0x5E2950, 0x5E29E5, 0xC237B0, kRows},
+
+        // ---- the watch group (Task 11) ----
+        {0x5DEA60, 0x5DEA74, 0xC23680, kWatches},      // RemoveQuestWatch (AscAttachLate detours its first 10 bytes)
+        {0x5DEA60, 0x5DEA99, 0xC23680, kWatches},      //   lea eax, m_questWatches[eax*4]
+        {0x5DEA60, 0x5DEABC, 0xC23674, kWatches},      //   mov m_questWatches[count-1].questId, 0
+        {0x5DEA60, 0x5DEACC, 0xC23678, kWatches},      //   mov m_questWatches[count-1].expireTime, 0
+        {0x5DEF60, 0x5DEF9A, 0xC23680, kWatches},      // ShiftQuestWatches (indices checked against the count)
+        {0x5DEF60, 0x5DEFA1, 0xC23680, kWatches},
+        {0x5DEF60, 0x5DEFCB, 0xC23680, kWatches},
+        {0x5DEF60, 0x5DEFF7, 0xC23680, kWatches},
+        {0x5DF610, 0x5DF66F, 0xC23AD0, kCount},        // Script_IsQuestWatched
+        {0x5DF610, 0x5DF67A, 0xC237B8, kRows},
+        {0x5DF610, 0x5DF683, 0xC237B0, kRows},
+        {0x5DF610, 0x5DF698, 0xC23680, kWatches},
+        {0x5DF610, 0x5DF6A0, 0x19F883, kWatchBound},   //   i < 25 ? watch : 0
+        {0x5DF700, 0x5DF746, 0xC23AD0, kCount},        // Script_RemoveQuestWatch (then RemoveQuestWatch)
+        {0x5DF700, 0x5DF751, 0xC237B8, kRows},
+        {0x5DF700, 0x5DF75A, 0xC237B0, kRows},
+        {0x5DF780, 0x5DF7D6, 0x19F883, kWatchBound},   // Script_GetQuestIndexForWatch: watch < 25
+        {0x5DF780, 0x5DF7E4, 0xC23680, kWatches},
+        {0x5DF780, 0x5DF7EE, 0xC23AD0, kCount},
+        {0x5DF780, 0x5DF7F9, 0xC237B0, kRows},
+        {0x5DFC40, 0x5DFC9D, 0xC23AD0, kCount},        // Script_GetQuestWatchIndex
+        {0x5DFC40, 0x5DFCA8, 0xC237B8, kRows},
+        {0x5DFC40, 0x5DFCB1, 0xC237B0, kRows},
+        {0x5DFC40, 0x5DFCC6, 0xC23680, kWatches},
+        {0x5DFC40, 0x5DFCD0, 0x19F883, kWatchBound},   //   i < 25 ? watch : 0
+        {0x5DFEF0, 0x5DFEFD, 0xC23684, kWatches},      // UpdateWatchTimers: mov esi, offset m_questWatches[0].expireTime
+        {0x5E0240, 0x5E0276, 0xC23680, kWatches},      // SaveTrackedQuests
+        {0x5E5C10, 0x5E5C48, 0xC23688, kWatches},      // SortQuestWatches: m_questWatches[0].distance
+        {0x5E5C10, 0x5E5C9C, 0xC23680, kWatches},      //   qsort base
+        {0x5E64D0, 0x5E64E4, 0xC237B0, kRows},         // AddQuestWatch: the quest's row, 50 -> 128 rows
+        {0x5E64D0, 0x5E64F8, 0x32F983, kBound},        //   cmp ecx, 32h -> cmp cl, 80h
+        {0x5E64D0, 0x5E6513, 0xC23680, kWatches},
+        {0x5E64D0, 0x5E6525, 0x19FA83, kWatchBound},   //   full at 25 -> 64 watches
+        {0x5E64D0, 0x5E6538, 0xC23680, kWatches},
+        {0x5E64D0, 0x5E6546, 0xC23684, kWatches},
+        {0x5E64D0, 0x5E655D, 0xC23684, kWatches},
+        {0x5E64D0, 0x5E6570, 0xC23684, kWatches},
+        {0x5E64D0, 0x5E657C, 0xC23684, kWatches},
+        {0x5E64D0, 0x5E658D, 0xC23684, kWatches},
+        {0x5E67C0, 0x5E6807, 0xC23AD0, kCount},        // Script_AddQuestWatch (then AddQuestWatch)
+        {0x5E67C0, 0x5E6812, 0xC237B8, kRows},
+        {0x5E67C0, 0x5E681B, 0xC237B0, kRows},
+        // GetPOIQuestIDByVisibleIndex walks the watches too; its list reads and POI bounds are Task 12's.
+        {0x5E3840, 0x5E38D5, 0xC23680, kWatches},
+        {0x5E3840, 0x5E3A22, 0xC23680, kWatches},
     };
-    const uint8_t kBoundOriginal[3] = {0x83, 0xF8, 0x32};   // cmp eax, 32h
-    const uint8_t kBoundPatched[3] = {0x80, 0xF8, 0x80};    // cmp al, 80h
+
+    bool IsWatchPatch(const OperandPatch& p) { return p.kind == kWatches || p.kind == kWatchBound; }
 
     // The quest log entry the four leaderboard functions below read, for any slot (they keep their slot < 0 test).
     const uint8_t* __cdecl SiteSlotEntry(const uint8_t* player, uint32_t slot)
@@ -1013,19 +1197,27 @@ namespace
         FlushInstructionCache(GetCurrentProcess(), reinterpret_cast<void*>(at), size);
     }
 
+    bool IsBound(const OperandPatch& p) { return p.kind == kBound || p.kind == kWatchBound; }
+    uint32_t BoundPatched(const OperandPatch& p) { return p.kind == kBound ? RowBound(p.original) : WatchBound(p.original); }
+
     bool OperandMatches(const OperandPatch& p)
     {
-        if (p.kind == kBound)
-            return memcmp(reinterpret_cast<const void*>(p.at), kBoundOriginal, 3) == 0;
+        if (IsBound(p))
+            return BoundPatched(p) != 0 && memcmp(reinterpret_cast<const void*>(p.at), &p.original, 3) == 0;
         return memcmp(reinterpret_cast<const void*>(p.at), &p.original, 4) == 0;
     }
 
     void ApplyOperand(const OperandPatch& p)
     {
-        if (p.kind == kBound)
-            return WriteCode(p.at, kBoundPatched, 3);
-        const uint32_t value = Relocated(p.original, reinterpret_cast<uint32_t>(s_list.rows),
-                                         reinterpret_cast<uint32_t>(&s_list.count));
+        if (IsBound(p))
+        {
+            const uint32_t bytes = BoundPatched(p);
+            return WriteCode(p.at, &bytes, 3);
+        }
+        const uint32_t value = p.kind == kWatches
+                                   ? RelocatedWatch(p.original, reinterpret_cast<uint32_t>(s_watches))
+                                   : Relocated(p.original, reinterpret_cast<uint32_t>(s_list.rows),
+                                               reinterpret_cast<uint32_t>(&s_list.count));
         WriteCode(p.at, &value, 4);
     }
 
@@ -1037,27 +1229,28 @@ namespace
         WriteCode(s.start, code, sizeof(code));
     }
 
-    // Applies one function's operand patches and slot site, all or nothing.
-    void PatchFunction(uint32_t function)
+    // Whether one function's operand patches and slot site all match the client (each mismatch is logged).
+    bool FunctionMatches(uint32_t function)
     {
         bool ok = true;
         for (const OperandPatch& p : kOperandPatches)
             if (p.function == function && !OperandMatches(p))
             {
-                AscLog::Printf("AscQuestLog64List: 0x%06X operand at 0x%06X does not match; function left unpatched",
-                               function, p.at);
+                AscLog::Printf("AscQuestLog64List: 0x%06X operand at 0x%06X does not match", function, p.at);
                 ok = false;
             }
         for (const SlotSite& s : kSlotSites)
             if (s.function == function && (memcmp(reinterpret_cast<const void*>(s.start), s.original, sizeof(s.original)) != 0 ||
                                            s.start + sizeof(s.original) != s.nullLabel))
             {
-                AscLog::Printf("AscQuestLog64List: 0x%06X slot site at 0x%06X does not match; function left unpatched",
-                               function, s.start);
+                AscLog::Printf("AscQuestLog64List: 0x%06X slot site at 0x%06X does not match", function, s.start);
                 ok = false;
             }
-        if (!ok)
-            return;
+        return ok;
+    }
+
+    void ApplyFunction(uint32_t function)
+    {
         for (const OperandPatch& p : kOperandPatches)
             if (p.function == function)
                 ApplyOperand(p);
@@ -1066,20 +1259,57 @@ namespace
                 ApplySlotSite(s);
     }
 
-    void PatchOperands()
+    bool InWatchGroup(uint32_t function)
     {
-        uint32_t done[64] = {};
+        for (const OperandPatch& p : kOperandPatches)
+            if (p.function == function && IsWatchPatch(p))
+                return true;
+        return false;
+    }
+
+    // The distinct functions of the table, in table order; `watchGroup` selects the watch group or the others.
+    uint32_t Functions(uint32_t* out, uint32_t max, bool watchGroup)
+    {
         uint32_t count = 0;
         for (const OperandPatch& p : kOperandPatches)
         {
             bool seen = false;
             for (uint32_t i = 0; i < count; ++i)
-                seen |= done[i] == p.function;
-            if (seen || count == 64)
-                continue;
-            done[count++] = p.function;
-            PatchFunction(p.function);
+                seen |= out[i] == p.function;
+            if (!seen && count < max && InWatchGroup(p.function) == watchGroup)
+                out[count++] = p.function;
         }
+        return count;
+    }
+
+    // Each list function on its own, all or nothing; the watch functions as one group, all or nothing, after which
+    // m_questWatches lives in s_watches (64). A mismatch anywhere in the group leaves every watch function on the
+    // client array (25 watches, list rows through the mirror).
+    void PatchOperands()
+    {
+        uint32_t functions[64];
+        const uint32_t count = Functions(functions, 64, false);
+        for (uint32_t i = 0; i < count; ++i)
+            if (FunctionMatches(functions[i]))
+                ApplyFunction(functions[i]);
+            else
+                AscLog::Printf("AscQuestLog64List: 0x%06X left unpatched", functions[i]);
+
+        const uint32_t watchCount = Functions(functions, 64, true);
+        bool ok = true;
+        for (uint32_t i = 0; i < watchCount; ++i)
+            ok &= FunctionMatches(functions[i]);
+        if (!ok)
+        {
+            AscLog::Printf("AscQuestLog64List: the quest watch functions left unpatched (25 watches)");
+            return;
+        }
+        // Carry over what the client array holds (empty at load; the module initialises before the world).
+        const uint32_t live = NumWatches() < AscQuestLog64::kNativeSlots ? NumWatches() : AscQuestLog64::kNativeSlots;
+        memcpy(s_watches, reinterpret_cast<const void*>(0xC23680), live * sizeof(Watch));
+        for (uint32_t i = 0; i < watchCount; ++i)
+            ApplyFunction(functions[i]);
+        s_watchesRelocated = true;
     }
 
     // ---- MAX_QUESTLOG_QUESTS / MAX_WATCHABLE_QUESTS ------------------------------------------------------------
@@ -1089,11 +1319,11 @@ namespace
     {
         if (!L)
             return;
-        for (const char* name : {"MAX_QUESTLOG_QUESTS", "MAX_WATCHABLE_QUESTS"})
-        {
-            lua_pushnumber(L, AscQuestLog64::LogSize());
-            lua_setfield(L, LUA_GLOBALSINDEX, name);
-        }
+        lua_pushnumber(L, AscQuestLog64::LogSize());
+        lua_setfield(L, LUA_GLOBALSINDEX, "MAX_QUESTLOG_QUESTS");
+        // AddQuestWatch takes 64 only once the watch array is relocated (PatchOperands); otherwise its 25.
+        lua_pushnumber(L, s_watchesRelocated ? AscQuestLog64::LogSize() : AscQuestLog64::kNativeSlots);
+        lua_setfield(L, LUA_GLOBALSINDEX, "MAX_WATCHABLE_QUESTS");
     }
     void ApplyInterfaceLimit() { SetInterfaceLimit(GetState()); }
 
@@ -1136,6 +1366,8 @@ namespace
             {0x5E43F0, reinterpret_cast<void*>(&Script_IsCurrentQuestFailed)},
             {0x5E4070, reinterpret_cast<void*>(&Script_IsUnitOnQuest)},
             {0x5E0870, reinterpret_cast<void*>(&GetQuestLogEntry)},   // also serves 0x5E58C0, 0x5E2950
+            {0x5E6240, reinterpret_cast<void*>(&Script_GetQuestTimers)},
+            {0x5E4FB0, reinterpret_cast<void*>(&Script_GetQuestIndexForTimer)},
         };
         for (const Replacement& r : replacements)
             AscRuntime::ReplaceFunction(r.address, r.fn);

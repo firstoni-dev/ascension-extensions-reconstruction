@@ -308,6 +308,20 @@ int main()
           "SlotSiteCode: dest eax needs no mov");
     used = SlotSiteCode(site, sizeof(site), 0x5E241D, 0x5E2436, kEax, kEcx, 0x10, 0x10001000);
     Check(used == 16 && site[12] == 0x8B && site[13] == 0xC8, "SlotSiteCode: mov ecx, eax");
+
+    // Task 11: the watch array (0xC23680, 25 x 12 bytes) moves to the DLL; its bounds go 25 -> 64.
+    Check(sizeof(Watch) == 12, "Watch: 12 bytes, as m_questWatches");
+    Check(RelocatedWatch(0xC23680, 0x10000000) == 0x10000000 && RelocatedWatch(0xC23684, 0x10000000) == 0x10000004
+          && RelocatedWatch(0xC23688, 0x10000000) == 0x10000008, "RelocatedWatch: base and fields");
+    Check(RelocatedWatch(0xC23674, 0x10000000) == 0x10000000 - 12 && RelocatedWatch(0xC23678, 0x10000000) == 0x10000000 - 8,
+          "RelocatedWatch: RemoveQuestWatch's [count-1] displacements");
+    Check(RowBound(0x32F883) == 0x80F880 && RowBound(0x32F983) == 0x80F980, "RowBound: cmp eax/ecx, 32h -> cmp al/cl, 80h");
+    Check(RowBound(0x32FE83) == 0 && RowBound(0x19F883) == 0 && RowBound(0x32C083) == 0,
+          "RowBound: refuses esi (no low byte), another immediate, not a cmp");
+    Check(WatchBound(0x19F883) == 0x40F883 && WatchBound(0x19FA83) == 0x40FA83, "WatchBound: cmp eax/edx, 19h -> 40h");
+    Check(WatchBound(0x32F883) == 0 && WatchBound(0x19C083) == 0, "WatchBound: refuses another immediate, not a cmp");
+    Check(TimerLeft(100, 50, 140) == 9 && TimerLeft(0, 50, 51) == -2 && TimerLeft(10, 0x7FFFFFF0, 0) > 0,
+          "TimerLeft: offset + time - now - 1");
     return failures ? 1 : 0;
 }
 '''
