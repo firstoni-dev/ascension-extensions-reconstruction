@@ -1,6 +1,10 @@
 cmake_minimum_required(VERSION 3.25)
 project(AscensionExtensions LANGUAGES C CXX)
 
+if(NOT CMAKE_SIZEOF_VOID_P EQUAL 4)
+    message(FATAL_ERROR "Extensions.dll must be built for x86 (32-bit)")
+endif()
+
 # Our own Extensions.dll for Ascension.exe (stock Wow.exe 12340 + a LoadLibraryA("Extensions.dll")
 # cave), built on the MIT WotLK-Extensions DLL sources vendored under WotLKExtensions/.
 # No Patcher, no injector: the exe loads a DLL of this name by itself.

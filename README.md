@@ -51,7 +51,7 @@ packets and fires events.
   sends quest log slots 25..63 in SMSG `0x8F7`, and the DLL announces CMSG `0x8F6` (u8 version 1, u8 64) after every
   world entry; a server that never answers keeps the native 25 slots. `AscQuestLog64::SlotEntry` is the client's
   quest log entry for any of the 64 slots. See `src/Ascension/AscQuestLog64.cpp`; `tests/quest_log_64.py` checks the
-  store. Build with `-DASCENSION_QUEST_LOG_64=OFF` for the genuine 25-slot behaviour. The IDA audit of the client
+  store, the list and the patch tables. Build with `-DASCENSION_QUEST_LOG_64=OFF` for the genuine 25-slot behaviour. The IDA audit of the client
   code it changes (`tools/ida/quest_log_64_xrefs.py`) and the in-game checklist are in `docs/QUEST_LOG_64.md`.
 
 The portable regression in `tests/native_ca_packets.py` compiles the production native packet handlers
