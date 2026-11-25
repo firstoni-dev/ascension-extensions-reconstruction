@@ -48,6 +48,7 @@ using namespace AscScript;
 @HEADER@
 @STORE@
 @HELLO@
+@LIST@
 
 int failures = 0;
 void Check(bool condition, char const* name)
@@ -219,6 +220,75 @@ int main()
     Check(seen.size() == 2 && seen[0].slot == 31 && seen[0].old.questId == 101
           && seen[1].slot == 32 && seen[1].old.questId == 0, "Changes: slots 31 and 32 with their old entries");
     Check(AscQuestLog64::Changes().empty(), "Changes empty outside a callback");
+
+    // ---- the quest list (AscQuestLog64List.cpp) ----
+    using namespace AscQuestLog64List;
+    static List list;
+    list = {};
+    Check(Append(list, 100, 0, 12) == 0 && Append(list, 101, 1, 12) == 2 && Append(list, 102, 30, -5) == 3,
+          "ListBuild: quest rows, a header after each new sort type");
+    Check(list.count == 5 && list.numSortTypes == 2 && list.rows[1].isHeader && list.rows[1].questId == 12
+          && list.rows[4].isHeader && list.rows[4].questId == -5 && list.rows[3].logSlot == 30,
+          "ListBuild: headers carry the sort type, quests their slot");
+    list = {};
+    for (uint32_t slot = 0; slot < 64; ++slot)
+        Append(list, static_cast<int32_t>(1000 + slot), slot, static_cast<int32_t>(slot + 1));
+    Check(list.count == 128 && list.numSortTypes == 64 && list.rows[127].isHeader && list.rows[126].logSlot == 63,
+          "ListBuild: 64 quests in 64 zones fill the 128 rows");
+    Check(QuestIndex(list, 1063) == 127 && QuestIndex(list, 64) == 0, "QuestIndex: row 126 is index 127; headers skipped");
+    Check(SortIndex(list, 41) == 40 && SortIndex(list, 999) == 0 && FindSort(list, 999, 64) == 64,
+          "SortIndex: found past 25; absent is 0");
+
+    Check(Collapsed(3, 0) && !Collapsed(3, 8) && !Collapsed(30, 0) && !Collapsed(24 + 8, 0),
+          "Collapsed: only the first 25 sort types have a bit");
+
+    int32_t old[64];
+    list = {};
+    for (uint32_t i = 0; i < 30; ++i)
+        Append(list, static_cast<int32_t>(500 + i), i, static_cast<int32_t>(i + 1));
+    SaveSortTypes(list, ~(1 << 2), old);   // type 3 (index 2) collapsed
+    Check(old[2] == 3 && old[0] == -1 && old[27] == -28, "SaveSortTypes: collapsed kept, expanded and past-25 negated");
+    // The rebuilt list has the types in another order: type 3 moves to index 0.
+    List next = {};
+    Append(next, 1, 0, 3);
+    Append(next, 2, 1, 1);
+    Append(next, 3, 2, 99);
+    const int32_t merged = MergeFilter(next, 0, old, 30);
+    Check(!(merged & 1) && (merged & 2) && (merged & 4), "MergeFilter: collapse follows the type; new types expand");
+    List wide = {};
+    for (uint32_t i = 0; i < 40; ++i)
+        Append(wide, static_cast<int32_t>(i + 1), i, static_cast<int32_t>(i + 1));
+    Check(MergeFilter(wide, 0, old, 0) == (1 << 25) - 1, "MergeFilter: no bit past the 25th type");
+
+    auto names = [](char const* a, char const* b) { return std::strcmp(a, b); };
+    SortKey questA = {false, true, 1, 10, "a"}, questB = {false, true, 1, 12, "b"}, headerKey = {true, true, 1, 0, nullptr};
+    SortKey folded = {false, true, 0, 1, "z"}, wideRow = {false, true, 40, 1, "w"}, unknown = {false, false, 0, 0, nullptr};
+    const int32_t filter = ~1;   // sort index 0 collapsed
+    Check(Compare(headerKey, questA, filter, names) < 0 && Compare(questA, headerKey, filter, names) > 0, "Compare: header first");
+    Check(Compare(questA, questB, filter, names) < 0 && Compare(questB, questA, filter, names) > 0, "Compare: by level");
+    Check(Compare(folded, questA, filter, names) > 0 && Compare(questA, folded, filter, names) < 0, "Compare: folded last");
+    Check(Compare(questA, wideRow, filter, names) < 0 && Compare(wideRow, questA, ~0, names) > 0,
+          "Compare: sort index past 25 orders and never folds");
+    Check(Compare(unknown, questA, filter, names) == 0 && Compare(questA, unknown, filter, names) == 0,
+          "Compare: an uncached quest compares equal");
+    SortKey sameLevel = {false, true, 1, 10, "c"};
+    Check(Compare(questA, sameLevel, filter, names) < 0, "Compare: same level by name");
+
+    Row native[50];
+    int32_t nativeSort[25];
+    uint32_t nativeCount = 0, nativeNumSort = 0;
+    memset(native, 0xCC, sizeof(native));
+    List full = {};
+    for (uint32_t slot = 0; slot < 64; ++slot)
+        Append(full, static_cast<int32_t>(1000 + slot), slot, static_cast<int32_t>(slot + 1));
+    Mirror(full, native, nativeCount, nativeSort, nativeNumSort);
+    Check(nativeCount == 50 && nativeNumSort == 25 && native[49].questId == full.rows[49].questId
+          && nativeSort[24] == 25, "Mirror: the first 50 rows and 25 sort types");
+    List small = {};
+    Append(small, 7, 0, 1);
+    Mirror(small, native, nativeCount, nativeSort, nativeNumSort);
+    Check(nativeCount == 2 && native[2].questId == 0 && native[49].isHeader == 0 && nativeSort[1] == 0,
+          "Mirror: the rest zeroed");
     return failures ? 1 : 0;
 }
 '''
@@ -232,6 +302,8 @@ def main():
     harness = HARNESS.replace('@HEADER@', function(header, 'namespace AscQuestLog64'))
     harness = harness.replace('@STORE@', function(cpp_source, 'namespace AscQuestLog64'))
     harness = harness.replace('@HELLO@', function(cpp_source, 'void SendHello()'))
+    list_source = (ROOT / 'src/Ascension/AscQuestLog64List.cpp').read_text(encoding='utf-8')
+    harness = harness.replace('@LIST@', function(list_source, 'namespace AscQuestLog64List'))
     compiler = shutil.which(os.environ.get('CXX', 'cl.exe' if os.name == 'nt' else 'c++'))
     if not compiler:
         raise SystemExit('A C++20 compiler is required.')
