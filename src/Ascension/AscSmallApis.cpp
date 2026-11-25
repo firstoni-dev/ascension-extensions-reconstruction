@@ -2,6 +2,7 @@
 #include <Ascension/AscBindings.hpp>
 #include <Ascension/AscDbc.hpp>
 #include <Ascension/AscObjectAddon.hpp>
+#include <Ascension/AscQuestLog64.hpp>
 #include <Ascension/AscRuntime.hpp>
 #include <Ascension/AscScript.hpp>
 #include <Client/CDataStore.hpp>
@@ -279,11 +280,27 @@ namespace
     const uint8_t* CreatureRec(uint32_t id) { return CacheRecord(0x67B6A0, 0xC5D690, id); }   // CreatureCache
 
     // FUN_101940a0: the client's quest list at 0xC237B0 (count 0xC23AD0), 16 bytes each: +0 quest id,
-    // +8 0 = still open.
+    // +8 0 = still open. ASCENSION_QUEST_LOG_64: the DLL's list (128 rows) and the 64 slots, the first empty slot
+    // ending the descriptor's 25 only (AscQuestLog64::FindLoggedQuest).
     template <class F> bool ForOpenLoggedQuest(uint8_t* player, F fn)
     {
-        const uint32_t count = *reinterpret_cast<const uint32_t*>(0xC23AD0);
         const uint8_t* desc = *reinterpret_cast<uint8_t**>(player + 8);
+#if ASCENSION_QUEST_LOG_64
+        uint32_t count = 0;
+        const uint32_t* rows = AscQuestLog64::QuestListRows(count);
+        for (uint32_t i = 0; i < count; ++i)
+        {
+            const uint32_t* e = rows + i * 4;
+            if (e[2] != 0)
+                continue;
+            // 32 bits, as in QuestRelevant (AscAttachFixes.cpp). The original reads the low word here too.
+            if (const uint8_t* logged = AscQuestLog64::FindLoggedQuest(desc, e[0]))
+                if (fn(e[0], logged))
+                    return true;
+        }
+        return false;
+#else
+        const uint32_t count = *reinterpret_cast<const uint32_t*>(0xC23AD0);
         for (uint32_t i = 0; i < count; ++i)
         {
             const uint32_t* e = reinterpret_cast<const uint32_t*>(0xC237B0 + i * 0x10);
@@ -304,6 +321,7 @@ namespace
             }
         }
         return false;
+#endif
     }
 
     // FUN_1008d8c0: stack count of `item` in the backpack (inventory slots 0x17..0x26) and the four

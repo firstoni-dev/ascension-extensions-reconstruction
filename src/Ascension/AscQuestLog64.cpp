@@ -97,6 +97,71 @@ namespace AscQuestLog64
         return out;
     }
 
+    namespace
+    {
+        uint32_t SlotQuest(const uint8_t* descriptor, uint32_t slot)
+        {
+            const uint8_t* e = SlotEntry(descriptor, slot);
+            uint32_t id = 0;
+            if (e)
+                memcpy(&id, e, 4);
+            return id;
+        }
+    }
+
+    const uint8_t* FindLoggedQuest(const uint8_t* descriptor, uint32_t questId)
+    {
+        for (uint32_t slot = 0; slot < kMaxSlots; ++slot)
+        {
+            const uint32_t id = SlotQuest(descriptor, slot);
+            if (id == 0)
+            {
+                if (slot < kNativeSlots)
+                    slot = kNativeSlots - 1;   // the walk's stop ends the descriptor's 25 only
+                continue;
+            }
+            if (id == questId)
+                return SlotEntry(descriptor, slot);
+        }
+        return nullptr;
+    }
+
+    int32_t QuestSlot(const uint8_t* descriptor, uint32_t questId)
+    {
+        for (uint32_t slot = 0; slot < kMaxSlots; ++slot)
+        {
+            const uint32_t id = SlotQuest(descriptor, slot);
+            if (id != 0 && id == questId)
+                return static_cast<int32_t>(slot);
+        }
+        return -1;
+    }
+
+    bool SlotValue(uint32_t slot, uint32_t addonBase, bool level, uint32_t (*addon)(uint32_t), int32_t& out)
+    {
+        if (slot < kNativeSlots)
+        {
+            out = static_cast<int32_t>(addon(slot + addonBase));
+            return true;
+        }
+        const Entry* e = Get(slot);
+        if (!e)
+            return false;
+        out = static_cast<int32_t>(level ? e->level : e->rewardXP);
+        return true;
+    }
+
+    int32_t LinkLevel(const uint8_t* descriptor, uint32_t questId, int32_t level, uint32_t (*addon)(uint32_t))
+    {
+        for (uint32_t slot = 0; slot < kMaxSlots; ++slot)
+        {
+            const uint32_t id = SlotQuest(descriptor, slot);
+            if (id != 0 && id == questId)
+                SlotValue(slot, 0x3D, true, addon, level);
+        }
+        return level;
+    }
+
     bool Apply(const uint8_t* data, uint32_t size)
     {
         if (size < 4)

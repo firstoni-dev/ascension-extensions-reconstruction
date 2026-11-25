@@ -2,6 +2,7 @@
 // suppressed (0x10112640, list 0x10BE2D98) -- while quest 0x1D0BB4 is in the client's quest log
 // (FUN_10112560 over FUN_101940a0: 0xC237B0, 16-byte entries, count 0xC23AD0, +0 quest id).
 #include <Ascension/AscBindings.hpp>
+#include <Ascension/AscQuestLog64.hpp>
 #include <Ascension/AscRuntime.hpp>
 
 namespace
@@ -10,9 +11,16 @@ namespace
     {
         if (spell != 0xE4E2D)
             return false;
+#if ASCENSION_QUEST_LOG_64
+        // The DLL's list (128 rows; AscQuestLog64List.cpp), same layout.
+        uint32_t count = 0;
+        const uint32_t* rows = AscQuestLog64::QuestListRows(count);
+#else
         const uint32_t count = *reinterpret_cast<const uint32_t*>(0xC23AD0);
+        const uint32_t* rows = reinterpret_cast<const uint32_t*>(0xC237B0);
+#endif
         for (uint32_t i = 0; i < count; ++i)
-            if (*reinterpret_cast<const uint32_t*>(0xC237B0 + i * 0x10) == 0x1D0BB4)
+            if (rows[i * 4] == 0x1D0BB4)
                 return true;
         return false;
     }

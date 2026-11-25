@@ -7,6 +7,7 @@
 //   0x6D1110 -> FUN_100e0ab0   QUEST_TURNED_IN(quest, a, b)
 //   0x6D4F80 -> FUN_100e0ba0   QUEST_REMOVED(quest)
 #include <Ascension/AscBindings.hpp>
+#include <Ascension/AscQuestLog64.hpp>
 #include <Ascension/AscRuntime.hpp>
 #include <Ascension/AscLua.hpp>
 #include <cstring>
@@ -128,13 +129,20 @@ namespace
     // FUN_100e0ba0 over 0x6D4F80 (__thiscall(player, slot), ret 4): after the original, QUEST_REMOVED
     // with the quest id the log slot holds (descriptor +0x278 + slot * 0x14) -- read after the removal,
     // as the original does.
+    // ASCENSION_QUEST_LOG_64: the byte slot of the 64 (25..63 from SMSG 0x8F7, still holding the quest until the
+    // server's next packet, as the descriptor does), 0 past 63.
     typedef void(__fastcall* Remove_t)(uint8_t*, void*, int32_t);
     Remove_t g_remove = nullptr;
     void __fastcall RemoveDetour(uint8_t* player, void* edx, int32_t slot)
     {
         g_remove(player, edx, slot);
         const uint8_t* d = *reinterpret_cast<uint8_t* const*>(player + 8);
+#if ASCENSION_QUEST_LOG_64
+        const uint8_t* e = AscQuestLog64::SlotEntry(d, static_cast<uint8_t>(slot));
+        AscRuntime::Signal("QUEST_REMOVED", "%u", e ? *reinterpret_cast<const uint32_t*>(e) : 0u);
+#else
         AscRuntime::Signal("QUEST_REMOVED", "%u", *reinterpret_cast<const uint32_t*>(d + 0x278 + slot * 0x14));
+#endif
     }
 
     void Init()

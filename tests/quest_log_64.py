@@ -223,6 +223,43 @@ int main()
           && seen[1].slot == 32 && seen[1].old.questId == 0, "Changes: slots 31 and 32 with their old entries");
     Check(AscQuestLog64::Changes().empty(), "Changes empty outside a callback");
 
+    // ---- Task 13: the DLL's readers over 64 slots ----
+    Setup();
+    static uint8_t qdesc[0x278 + 25 * 0x14];
+    memset(qdesc, 0, sizeof(qdesc));
+    auto setSlot = [](uint32_t slot, uint32_t quest) { memcpy(qdesc + 0x278 + slot * 0x14, &quest, 4); };
+    setSlot(0, 11);
+    setSlot(1, 12);
+    setSlot(5, 55);   // after the empty slot 2: the genuine walk never reaches it
+    Bytes ov;
+    ov.U8(1).U8(1).U8(64).U8(2);
+    ov.U8(40).U32(777).U32(0).U16(0).U16(0).U16(0).U16(0).U32(0).U32(21).U32(1350);
+    ov.U8(50).U32(12).U32(0).U16(0).U16(0).U16(0).U16(0).U32(0).U32(30).U32(9);
+    Feed(ov);
+    uint32_t (*addonFn)(uint32_t) = [](uint32_t index) { return 1000u + index; };
+    int32_t level = 0, xp = 0;
+    const int32_t slot777 = AscQuestLog64::QuestSlot(qdesc, 777);
+    Check(slot777 == 40 && AscQuestLog64::SlotValue(40, 0x3D, true, addonFn, level) && level == 21
+          && AscQuestLog64::SlotValue(40, 0x24, false, addonFn, xp) && xp == 1350
+          && AscQuestLog64::LinkLevel(qdesc, 777, 5, addonFn) == 21, "OverflowQuestLevelAndXp: slot 40 level 21, XP 1350, link 21");
+    Check(AscQuestLog64::SlotValue(1, 0x3D, true, addonFn, level) && level == 1000 + 0x3E
+          && AscQuestLog64::SlotValue(1, 0x24, false, addonFn, xp) && xp == 1000 + 0x25,
+          "SlotValue: slots 0..24 read the addon field base + slot");
+    Check(!AscQuestLog64::SlotValue(41, 0x3D, true, addonFn, level) && !AscQuestLog64::SlotValue(64, 0x3D, true, addonFn, level)
+          && AscQuestLog64::QuestSlot(qdesc, 778) == -1 && AscQuestLog64::LinkLevel(qdesc, 778, 5, addonFn) == 5,
+          "SlotValue / QuestSlot / LinkLevel: an empty or unknown slot keeps the native value");
+    Check(AscQuestLog64::QuestSlot(qdesc, 55) == 5 && AscQuestLog64::QuestSlot(qdesc, 12) == 1,
+          "QuestSlot: every slot read, first match");
+    Check(AscQuestLog64::LinkLevel(qdesc, 12, 5, addonFn) == 30, "LinkLevel: every matching slot overrides, the last wins");
+    Check(AscQuestLog64::FindLoggedQuest(qdesc, 12) == qdesc + 0x278 + 0x14 && AscQuestLog64::FindLoggedQuest(qdesc, 55) == nullptr,
+          "FindLoggedQuest: the first empty slot ends the descriptor's 25");
+    uint8_t const* found = AscQuestLog64::FindLoggedQuest(qdesc, 777);
+    uint32_t foundId = 0;
+    if (found)
+        memcpy(&foundId, found, 4);
+    Check(found == AscQuestLog64::SlotEntry(qdesc, 40) && foundId == 777 && AscQuestLog64::FindLoggedQuest(qdesc, 999) == nullptr,
+          "FindLoggedQuest: slots 25..63 are read sparsely past the stop");
+
     // ---- the quest list (AscQuestLog64List.cpp) ----
     using namespace AscQuestLog64List;
     static List list;
@@ -374,6 +411,27 @@ int main()
     ShiftComplete(pois, complete, 3, 0.5f);
     Check(pois[26].iconX == 100 && pois[26].iconY == 0 && pois[40].iconX == 125 && pois[40].iconY == 43
           && pois[63].iconX == 9000 && pois[63].iconY == 0, "ShiftComplete: stacked completed icons fan out past slot 25");
+
+    // Task 13: the world checks and the refresh decisions.
+    Check(SlotBytesBound(0x21C) == 0x528 && SlotBytesBound(0x200) == 0, "SlotBytesBound: 0x28 + 25 * 0x14 -> 0x28 + 64 * 0x14");
+    // CheckForQuestItemLoot's site: slot eax, dest esi, player [ebp-0Ch], 20 bytes at 0x6D7E20, done = its end.
+    used = SlotSiteCode(site, 20, 0x6D7E20, 0x6D7E34, kEax, kEsi, -0x0C, 0x10001000);
+    memcpy(&rel, site + 5, 4);
+    Check(used == 16 && site[0] == 0x50 && site[3] == 0xF4 && 0x6D7E20 + 9 + rel == 0x10001000 && site[12] == 0x8B
+          && site[13] == 0xF0 && site[14] == 0xEB && 0x6D7E20 + 16 + site[15] == 0x6D7E34 && site[19] == 0x90,
+          "SlotSiteCode: CheckForQuestItemLoot mov esi, eax and jmp to the block end");
+    uint8_t failed[60];
+    used = FailedSiteCode(failed, sizeof(failed), 0x6D807A, 0x6D80B9, 0x10002000);
+    memcpy(&rel, failed + 5, 4);
+    Check(used == 16 && failed[0] == 0x8B && failed[1] == 0x7D && failed[2] == 0xFC && failed[3] == 0x57 && failed[4] == 0xE8
+          && 0x6D807A + 9 + rel == 0x10002000 && failed[9] == 0x83 && failed[10] == 0xC4 && failed[11] == 0x04
+          && failed[12] == 0x8B && failed[13] == 0xD8 && failed[14] == 0xEB && 0x6D807A + 16 + failed[15] == 0x6D80B9
+          && failed[16] == 0x90 && failed[59] == 0x90,
+          "FailedSiteCode: mov edi, [ebp-4] / push edi / call / add esp, 4 / mov ebx, eax / jmp");
+    Check(AcceptedChange(40, 0, 0, 0) && AcceptedChange(40, 0, 39, 0) && AcceptedChange(40, 0, 40, 2)
+          && !AcceptedChange(40, 1, 40, 0) && !AcceptedChange(40, 2, 40, 2) && !AcceptedChange(0, 0, 40, 0),
+          "AcceptedChange: a new quest or a failure lifted; not a counter change or a removal");
+    Check(LeftSlot(0, 40) && LeftSlot(41, 40) && !LeftSlot(40, 40) && !LeftSlot(40, 0), "LeftSlot: the old quest left the slot");
     return failures ? 1 : 0;
 }
 '''

@@ -40,6 +40,22 @@ namespace AscQuestLog64
     // slot is empty) for 25..63, nullptr otherwise. Each slot has its own mirror.
     const uint8_t* SlotEntry(const uint8_t* descriptor, uint32_t slot);
 
+    // Readers over the 64 slots (the DLL's own quest checks; `descriptor` is the active player's).
+    // The first slot holding `questId` as the genuine DLL's walks find it: they stop at the first empty slot, which
+    // now ends only the descriptor's 25; slots 25..63 are then read sparsely. Its entry (SlotEntry), or nullptr.
+    const uint8_t* FindLoggedQuest(const uint8_t* descriptor, uint32_t questId);
+    // The first of the 64 slots holding `questId` (non-zero), every slot read; -1 when none.
+    int32_t QuestSlot(const uint8_t* descriptor, uint32_t questId);
+    // A slot's scaled level (`level`) or reward XP: the player's addon field `addonBase + slot` for 0..24 (`addon`),
+    // the 0x8F7 entry for 25..63; false for an empty slot of 25..63 or past 63.
+    bool SlotValue(uint32_t slot, uint32_t addonBase, bool level, uint32_t (*addon)(uint32_t), int32_t& out);
+    // A quest link's level: every slot holding `questId` overrides `level` with its scaled level (addon 0x3D + slot).
+    int32_t LinkLevel(const uint8_t* descriptor, uint32_t questId, int32_t level, uint32_t (*addon)(uint32_t));
+
+    // CGQuestLog::m_quests as the DLL keeps it (AscQuestLog64List.cpp): `count` rows of four dwords {questId, logSlot,
+    // isHeader, expired}, up to 128 (the client's 0xC237B0 / count 0xC23AD0 held 50).
+    const uint32_t* QuestListRows(uint32_t& count);
+
     // Parses and applies one SMSG 0x8F7 body; false (and nothing applied) when it is malformed.
     bool Apply(const uint8_t* data, uint32_t size);
     // The store emptied and LogSize back to kNativeSlots.

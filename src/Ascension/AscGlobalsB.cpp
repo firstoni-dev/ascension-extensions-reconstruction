@@ -7,6 +7,7 @@
 // pushes nil.
 #include <Ascension/AscBindings.hpp>
 #include <Ascension/AscDbc.hpp>
+#include <Ascension/AscQuestLog64.hpp>
 #include <Ascension/AscRuntime.hpp>
 #include <Ascension/AscScript.hpp>
 #include <Ascension/RealmInfo.hpp>
@@ -196,13 +197,21 @@ namespace
         return 1;
     }
 
-    // Quest log slots at player descriptor +0x278, 0x14 each; the index comes from 0x5DEEB0.
+    // Quest log slots at player descriptor +0x278, 0x14 each (ASCENSION_QUEST_LOG_64: the 64 slots, 25..63 from
+    // SMSG 0x8F7); the index comes from 0x5DEEB0.
     int GetQuestLogIndexByID(lua_State* L)
     {
         const int32_t quest = ArgInt(L, 1);
         uint8_t* d = PlayerDescriptors();
         if (!d)
             return 0;
+#if ASCENSION_QUEST_LOG_64
+        if (AscQuestLog64::QuestSlot(d, static_cast<uint32_t>(quest)) >= 0)
+        {
+            AscLua::lua_pushinteger(L, reinterpret_cast<int(__cdecl*)(int32_t)>(0x5DEEB0)(quest));
+            return 1;
+        }
+#else
         for (uint32_t i = 0; i < 25; ++i)
         {
             const int32_t q = *reinterpret_cast<int32_t*>(d + 0x278 + i * 0x14);
@@ -212,6 +221,7 @@ namespace
                 return 1;
             }
         }
+#endif
         AscLua::lua_pushinteger(L, 0);
         return 1;
     }

@@ -7,9 +7,13 @@
 // 25 ints, count 0xC23AD4) are too small for 64 quests and their zone headers; the list below holds 128 rows and 64
 // sort types (as CoA64 sizes them). Three techniques: functions with list logic or descriptor slot walks are ported;
 // functions that only index the list get their operands pointed at the DLL list (kOperandPatches); the four
-// leaderboard functions also get their one descriptor read replaced by a call (kSlotSites). Three DLL readers (Task 13)
-// still read the old arrays, so after every write the first 50 rows and 25 sort types are copied back there with the
-// counts clamped (Mirror); those readers miss only rows 50+. See Sync.
+// leaderboard functions also get their one descriptor read replaced by a call (kSlotSites). The DLL's own readers use
+// AscQuestLog64::QuestListRows. Only when a function stays unpatched (bytes not matching) are the first 50 rows and 25
+// sort types copied back into the old arrays (Mirror; see Sync).
+//
+// World checks and the refresh (Task 13). CheckForQuestItemLoot gets a slot site and a 64-slot bound,
+// Packet_Group_17 its slot walk replaced by a call, CanHighlight is ported; after every 0x8F7 Refresh runs what
+// OnUpdateQuest (0x6DF370) runs for a quest update-field change, for the changed slots 25..63.
 //
 // The watches (Task 11). CGQuestLog::m_questWatches (0xC23680, 25 x 12 bytes) moves to s_watches (64) by the same
 // operand patches, applied to the watch functions as one group; the timer Lua functions are ported.
@@ -264,6 +268,43 @@ namespace AscQuestLog64List
         return n + 1;
     }
 
+    // Task 13. A descriptor slot walk bounded by its byte offset, `cmp r, 21Ch` (0x28 + 25 * 0x14: the end of
+    // m_playerQuestLog behind player + 0x1008) -> 0x528 (64 slots; the entries past 25 come from SiteSlotEntry). 0
+    // for any other value.
+    uint32_t SlotBytesBound(uint32_t original)
+    {
+        return original == 0x28 + AscQuestLog64::kNativeSlots * 0x14 ? 0x28 + AscQuestLog64::kMaxSlots * 0x14 : 0;
+    }
+
+    // The code replacing Packet_Group_17's (0x6D8030) slot walk at `start` (`size` bytes, nops after it):
+    //     mov edi, [ebp-4] / push edi / call target / add esp, 4 / mov ebx, eax / jmp short done
+    // edi = the quest id, ebx = whether its log entry is failed (state bit 1), as the walk leaves them. Returns the
+    // bytes used (16).
+    uint32_t FailedSiteCode(uint8_t* code, uint32_t size, uint32_t start, uint32_t done, uint32_t target)
+    {
+        memset(code, 0x90, size);
+        const uint8_t head[] = {0x8B, 0x7D, 0xFC, 0x57, 0xE8};
+        memcpy(code, head, sizeof(head));
+        uint32_t n = sizeof(head);
+        const uint32_t rel = target - (start + n + 4);
+        memcpy(code + n, &rel, 4);
+        n += 4;
+        const uint8_t tail[] = {0x83, 0xC4, 0x04, 0x8B, 0xD8, 0xEB};
+        memcpy(code + n, tail, sizeof(tail));
+        n += sizeof(tail);
+        code[n] = static_cast<uint8_t>(done - (start + n + 1));
+        return n + 1;
+    }
+
+    // OnUpdateQuest's (0x6DF370) per-slot decisions, from the slot's entry before and after the change.
+    // "Quest accepted" (message, tutorials, QUEST_ACCEPTED): a new quest, or a failed one no longer failed.
+    bool AcceptedChange(uint32_t quest, uint32_t state, uint32_t oldQuest, uint32_t oldState)
+    {
+        return quest && (quest != oldQuest || (!(state & 2) && (oldState & 2)));
+    }
+    // The old quest's point display is removed when the slot now holds another quest.
+    bool LeftSlot(uint32_t quest, uint32_t oldQuest) { return oldQuest && quest != oldQuest; }
+
     // CGQuestLog::m_questPOIs entry (0xC23B00, 25 of them); the DLL keeps 64 (CoA64 m_questPOIs). `blob*` is the
     // TSGrowableArray<QuestPOIBlob> (0x34-byte blobs; the client allocates them, ShutdownGame frees them).
     struct Poi
@@ -507,11 +548,16 @@ namespace
     uint16_t EntryCount(const uint8_t* e, uint32_t i) { return *reinterpret_cast<const uint16_t*>(e + 8 + i * 2); }
     uint32_t EntryTime(const uint8_t* e) { return *reinterpret_cast<const uint32_t*>(e + 16); }
 
-    // The copy back into m_quests / m_sortTypes. No client function reads it once every patch applies; it is left
-    // for the DLL's own readers of 0xC237B0 / 0xC23AD0 (Task 13): AscAttachFixes QuestRelevant, AscSmallApis
-    // ForOpenLoggedQuest and AscQuestSpellHide HiddenSpell, and for a function whose bytes did not match and stayed
-    // unpatched (a list function, the watch group or the POI group). Task 13 removes it.
-    void Sync() { Mirror(s_list, NativeRows(), NativeCount(), NativeSortTypes(), NativeNumSortTypes()); }
+    // The copy back into m_quests / m_sortTypes, for a client function whose bytes did not match and stayed unpatched
+    // (a list function, the watch group or the POI group; PatchOperands sets s_mirrorNeeded). Once every patch
+    // applies no client function reads those arrays, and the DLL's own readers use AscQuestLog64::QuestListRows, so
+    // nothing is copied.
+    bool s_mirrorNeeded = false;
+    void Sync()
+    {
+        if (s_mirrorNeeded)
+            Mirror(s_list, NativeRows(), NativeCount(), NativeSortTypes(), NativeNumSortTypes());
+    }
 
     const Row* QuestRow(int32_t index)
     {
@@ -1344,6 +1390,106 @@ namespace
         return -1;
     }
 
+    // ---- Task 13: world checks -----------------------------------------------------------------------------------
+
+    // 0x70F580 CGGameObject_C::CanHighlight (thiscall, no argument; __fastcall with an unused edx has the same
+    // contract): an object with a quest (its stats' id for the lock type) is highlighted only while that quest is in
+    // one of the 64 slots. Full eax (mov eax, 1 / xor eax, eax).
+    int __fastcall CanHighlight(const uint8_t* self, void*)
+    {
+        void* typeData = *reinterpret_cast<void* const*>(self + 0x1A0);
+        typedef uint8_t(__thiscall* Usable_t)(void*);   // type data vtable +0x0C, tested as al
+        if (!(*reinterpret_cast<Usable_t const*>(*reinterpret_cast<const uint8_t* const*>(typeData) + 0x0C))(typeData))
+            return 0;
+        const int8_t type = static_cast<int8_t>(*(*reinterpret_cast<const uint8_t* const*>(self + 0xD0) + 0x2D));
+        const uint32_t index = reinterpret_cast<uint32_t(__cdecl*)(int32_t, int32_t)>(0x746190)(type, 0x14);
+        const uint8_t* stats = *reinterpret_cast<const uint8_t* const*>(self + 0x1A4);
+        if (!stats || index >= 0x18)
+            return 1;
+        const int32_t quest = *reinterpret_cast<const int32_t*>(stats + index * 4 + 0x14);
+        if (quest <= 0)
+            return 1;
+        const uint8_t* player = Player();
+        if (!player)
+            return 0;
+        for (uint32_t slot = 0; slot < kMaxSlots; ++slot)
+            if (const uint8_t* e = LogEntry(player, slot))
+                if (static_cast<int32_t>(EntryQuest(e)) == quest)
+                    return 1;
+        return 0;
+    }
+
+    // ---- Task 13: the refresh after SMSG 0x8F7 -------------------------------------------------------------------
+
+    // OnUpdateQuest's (0x6DF370) per-slot half (CoA64 QuestLogSlotUpdated) for a slot of 25..63, with its entry
+    // before the packet (`old`, 0x14 bytes). The client's own OnUpdateQuest keeps serving descriptor slots 0..24.
+    void SlotUpdated(uint8_t* player, uint32_t slot, const uint8_t* old)
+    {
+        const uint8_t* entry = LogEntry(player, slot);
+        if (!entry)
+            return;
+        if (AcceptedChange(EntryQuest(entry), EntryState(entry), EntryQuest(old), EntryState(old)))
+        {
+            // 0x6DF2B0 QuestAcceptCallback (runs the same block once the record arrives)
+            if (const uint8_t* q = Quest(static_cast<int32_t>(EntryQuest(entry)), 0x6DF2B0))
+            {
+                typedef void(__cdecl* Error_t)(int, ...);         // CGGameUI::DisplayError 0x5216F0
+                typedef void(__cdecl* Tutorial_t)(int);           // CGTutorial::TriggerTutorial 0x530840
+                typedef uint8_t(__cdecl* Flagged_t)(int);         // IsTutorialFlagged 0x5222B0 (al)
+                typedef void(__cdecl* SignalEvent_t)(int, const char*, ...);   // FrameScript_SignalEvent 0x81B530
+                reinterpret_cast<Error_t>(0x5216F0)(0x92, q + kQName);   // ERR_QUEST_ACCEPTED_S
+                if (Q<int32_t>(q, 0x14) == 1)
+                {
+                    reinterpret_cast<Tutorial_t>(0x530840)(0x28);
+                    reinterpret_cast<Tutorial_t>(0x530840)(0x26);
+                }
+                uint32_t& accepted = *reinterpret_cast<uint32_t*>(0xC9EB08);   // s_questsAccepted
+                if (!reinterpret_cast<Flagged_t>(0x5222B0)(0x14) && ++accepted >= 4)
+                    reinterpret_cast<Tutorial_t>(0x530840)(0x14);
+                reinterpret_cast<SignalEvent_t>(0x81B530)(0x270, "%d", GetQuestIndex(Q<int32_t>(q, 0)));   // QUEST_ACCEPTED
+            }
+        }
+        if (const uint8_t* q = Quest(static_cast<int32_t>(EntryQuest(LogEntry(player, slot)))))
+        {
+            const int32_t index = GetQuestIndex(Q<int32_t>(q, 0)) - 1;
+            if (index >= 0 && (Q<uint32_t>(q, kQFlags) & 0x10000) && IsQuestCompleteEx(static_cast<uint32_t>(index), 1))
+            {
+                uint32_t guid[2];   // the player's own guid (descriptor +0)
+                memcpy(guid, *reinterpret_cast<const uint8_t* const*>(player + 8), 8);
+                // CGPlayer_C::CompleteQuest 0x6D4D40 (stdcall: guid*, quest id; ret 8)
+                reinterpret_cast<void(__stdcall*)(const uint32_t*, int32_t)>(0x6D4D40)(guid, Q<int32_t>(q, 0));
+            }
+        }
+        if (LeftSlot(EntryQuest(LogEntry(player, slot)), EntryQuest(old)))
+            reinterpret_cast<void(__cdecl*)(uint32_t)>(0x5DEC10)(EntryQuest(old));   // RemoveQuestPointDisplay
+    }
+
+    // After every applied 0x8F7 (CoA64 QuestLogExtendedClient Refresh): what OnUpdateQuest runs once for the packet
+    // (quest-giver status, CGQuestLog::Update(1): rebuild, re-sort, POI query, QUEST_LOG_UPDATE), then its per-slot
+    // half for each changed slot. Changes() is empty for the first packet after a clear, so a login shows no
+    // "Quest accepted". QUEST_LOG_UPDATE is sent once: by Update(1), or here when Update(1) returns before its signal
+    // because quest records are still being fetched (s_questCallbackCount).
+    void Refresh()
+    {
+        uint8_t* player = Player();
+        if (!player)
+            return;
+        QueryQuestGiverStatus();
+        const bool pending = CallbackCount() != 0;
+        Update(1);
+        if (pending)
+            Signal(kQuestLogUpdate);
+        for (const AscQuestLog64::Change& c : AscQuestLog64::Changes())
+        {
+            uint8_t old[0x14];
+            memcpy(old, &c.old.questId, 4);
+            memcpy(old + 4, &c.old.state, 4);
+            memcpy(old + 8, c.old.counters, 8);
+            memcpy(old + 16, &c.old.time, 4);
+            SlotUpdated(player, c.slot, old);
+        }
+    }
+
     // ---- operand patches: client functions that only index the list ------------------------------------------
     //
     // Instead of a port, every operand that addresses the old list is pointed at the DLL list: m_quests row
@@ -1365,11 +1511,13 @@ namespace
     // in the group too, since the function holds POI operands. UpdatePOIIcons and GetPOIQuestIDByVisibleIndex are
     // ported and read whichever array is in use. The client's static constructor (0x9CB280) and atexit destructor
     // (0x9D64D0) of m_questPOIs keep working on the old, then unused, array.
-    enum OperandKind : uint8_t { kRows, kCount, kBound, kWatches, kWatchBound, kPois, kPoiImm, kPoiBound };
+    //
+    // Task 13: CheckForQuestItemLoot's descriptor walk bound 21Ch -> 528h (kSlotBytes; its slot read is a slot site).
+    enum OperandKind : uint8_t { kRows, kCount, kBound, kWatches, kWatchBound, kPois, kPoiImm, kPoiBound, kSlotBytes };
     struct OperandPatch
     {
         uint32_t function;
-        uint32_t at;         // the operand's 4 bytes (kRows, kCount, kWatches, kPois, kPoiImm); the instruction (bounds)
+        uint32_t at;         // the operand's 4 bytes (kRows, kCount, kWatches, kPois, kPoiImm, kSlotBytes); the instruction (bounds)
         uint32_t original;   // the operand's value; for a bound, the instruction's 3 bytes little-endian
         OperandKind kind;
     };
@@ -1557,6 +1705,7 @@ namespace
         {0x5E7370, 0x5E73F0, 0x0004B0, kPoiImm},
         {0x5E7370, 0x5E7412, 0x19F883, kPoiBound},     //   slot from FindOrFreePOISlot < 25 (jnb)
         {0x5E7370, 0x5E7425, 0xC23B00, kPois},
+        {0x6D7DE0, 0x6D7EE3, 0x00021C, kSlotBytes},    // CGPlayer_C::CheckForQuestItemLoot: cmp edi, 21Ch (slot walk)
     };
 
     bool IsWatchPatch(const OperandPatch& p) { return p.kind == kWatches || p.kind == kWatchBound; }
@@ -1577,27 +1726,64 @@ namespace
     //     push slot / push [ebp+player] / call SiteSlotEntry / add esp, 8 / mov dest, eax / jmp done / nops
     // which clobbers eax, ecx and edx as the original block does. The rest of each function (3 KB for
     // GetQuestLeaderBoardByID, with AscAttachLate's byte patches) runs unchanged.
+    //
+    // Task 13: CheckForQuestItemLoot (0x6D7DE0) reads its entry in a 20-byte block,
+    //     cmp eax, 19h / ja next / mov eax, [ebp-0Ch] (player) / mov esi, [eax+1008h] / add esi, edi
+    // which becomes the same call (dest esi) and a jmp to the block's end, where the original tests esi for null.
+    // Its `jl` before the block stays; its walk bound is a kSlotBytes operand patch.
     struct SlotSite
     {
-        uint32_t function, start, nullLabel, done;
+        uint32_t function, start, nullLabel, done;   // nullLabel: the first byte after the replaced block
         X86Reg slot, dest;
         int8_t player;          // [ebp + player]
+        uint8_t size;           // bytes replaced (start .. nullLabel)
         uint8_t original[23];
     };
     const SlotSite kSlotSites[] = {
-        {0x5E1460, 0x5E1553, 0x5E156A, 0x5E156C, kEdi, kEdi, -4,
+        {0x5E1460, 0x5E1553, 0x5E156A, 0x5E156C, kEdi, kEdi, -4, 23,
          {0x83, 0xFF, 0x19, 0x77, 0x12, 0x8B, 0x55, 0xFC, 0x8B, 0x82, 0x08, 0x10, 0x00, 0x00, 0x8D, 0x4C, 0xBF, 0x0A,
           0x8D, 0x3C, 0x88, 0xEB, 0x02}},
-        {0x5E20A0, 0x5E218C, 0x5E21A3, 0x5E21A5, kEsi, kEax, 0x0C,
+        {0x5E20A0, 0x5E218C, 0x5E21A3, 0x5E21A5, kEsi, kEax, 0x0C, 23,
          {0x83, 0xFE, 0x19, 0x77, 0x12, 0x8B, 0x4D, 0x0C, 0x8B, 0x91, 0x08, 0x10, 0x00, 0x00, 0x8D, 0x44, 0xB6, 0x0A,
           0x8D, 0x04, 0x82, 0xEB, 0x02}},
-        {0x5E2370, 0x5E241D, 0x5E2434, 0x5E2436, kEax, kEcx, 0x10,
+        {0x5E2370, 0x5E241D, 0x5E2434, 0x5E2436, kEax, kEcx, 0x10, 23,
          {0x83, 0xF8, 0x19, 0x77, 0x12, 0x8B, 0x4D, 0x10, 0x8B, 0x91, 0x08, 0x10, 0x00, 0x00, 0x8D, 0x44, 0x80, 0x0A,
           0x8D, 0x0C, 0x82, 0xEB, 0x02}},
-        {0x5E2630, 0x5E26DD, 0x5E26F4, 0x5E26F6, kEax, kEax, 0x10,
+        {0x5E2630, 0x5E26DD, 0x5E26F4, 0x5E26F6, kEax, kEax, 0x10, 23,
          {0x83, 0xF8, 0x19, 0x77, 0x12, 0x8B, 0x4D, 0x10, 0x8B, 0x91, 0x08, 0x10, 0x00, 0x00, 0x8D, 0x44, 0x80, 0x0A,
           0x8D, 0x04, 0x82, 0xEB, 0x02}},
+        {0x6D7DE0, 0x6D7E20, 0x6D7E34, 0x6D7E34, kEax, kEsi, -0x0C, 20,
+         {0x83, 0xF8, 0x19, 0x0F, 0x87, 0xAF, 0x00, 0x00, 0x00, 0x8B, 0x45, 0xF4, 0x8B, 0xB0, 0x08, 0x10, 0x00, 0x00,
+          0x03, 0xF7}},
     };
+
+    // ---- Task 13: Packet_Group_17's slot walk -------------------------------------------------------------------
+    //
+    // Packet_Group_17 (0x6D8030, SMSG_QUESTUPDATE_*) looks the quest up in the 25 descriptor slots, in 60 bytes from
+    // 0x6D807A (mov edi, [ebp-4]) to 0x6D80B6: edi = the quest id, ebx = 1 when its first slot is failed. That block
+    // becomes FailedSiteCode calling QuestFailedInLog, over 64 slots. No jump from outside lands inside it, and
+    // eax / ecx / edx / esi are set again after it (0x6D80B9 onward) before they are read.
+    const uint8_t kFailedSiteOriginal[] = {
+        0x8B, 0x7D, 0xFC, 0x33, 0xF6, 0x8D, 0x53, 0x28, 0x85, 0xF6, 0x7C, 0x13, 0x83, 0xFE, 0x19, 0x77, 0x0E, 0x8B, 0x88,
+        0x08, 0x10, 0x00, 0x00, 0x03, 0xCA, 0x74, 0x04, 0x39, 0x39, 0x74, 0x10, 0x83, 0xC2, 0x14, 0x83, 0xC6, 0x01, 0x81,
+        0xFA, 0x1C, 0x02, 0x00, 0x00, 0x72, 0xDB, 0xEB, 0x10, 0xF6, 0x41, 0x04, 0x02, 0x74, 0x0A, 0xBB, 0x01, 0x00, 0x00,
+        0x00, 0xEB, 0x03};
+    constexpr uint32_t kFailedSite = 0x6D807A, kFailedSiteDone = 0x6D80B9;
+    static_assert(sizeof(kFailedSiteOriginal) == 0x6D80B6 - 0x6D807A, "Packet_Group_17 slot walk");
+
+    // The active player's first slot (0..63) holding `questId`: 1 when it is failed (state bit 1), else 0 (also when
+    // the quest is not logged). Full eax: the site moves it to ebx, which the function tests as a whole.
+    int __cdecl QuestFailedInLog(uint32_t questId)
+    {
+        const uint8_t* player = Player();
+        if (!player)
+            return 0;
+        for (uint32_t slot = 0; slot < kMaxSlots; ++slot)
+            if (const uint8_t* e = LogEntry(player, slot))
+                if (EntryQuest(e) == questId)
+                    return (EntryState(e) & 2) ? 1 : 0;
+        return 0;
+    }
 
     void WriteCode(uint32_t at, const void* bytes, uint32_t size)
     {
@@ -1617,7 +1803,7 @@ namespace
     {
         if (IsBound(p))
             return BoundPatched(p) != 0 && memcmp(reinterpret_cast<const void*>(p.at), &p.original, 3) == 0;
-        if (p.kind == kPoiImm && !PoiImm(p.original))
+        if ((p.kind == kPoiImm && !PoiImm(p.original)) || (p.kind == kSlotBytes && !SlotBytesBound(p.original)))
             return false;
         return memcmp(reinterpret_cast<const void*>(p.at), &p.original, 4) == 0;
     }
@@ -1635,6 +1821,7 @@ namespace
         case kWatches: value = RelocatedWatch(p.original, reinterpret_cast<uint32_t>(s_watches)); break;
         case kPois: value = RelocatedPoi(p.original, reinterpret_cast<uint32_t>(s_pois)); break;
         case kPoiImm: value = PoiImm(p.original); break;
+        case kSlotBytes: value = SlotBytesBound(p.original); break;
         default:
             value = Relocated(p.original, reinterpret_cast<uint32_t>(s_list.rows), reinterpret_cast<uint32_t>(&s_list.count));
             break;
@@ -1645,9 +1832,8 @@ namespace
     void ApplySlotSite(const SlotSite& s)
     {
         uint8_t code[sizeof(s.original)];
-        SlotSiteCode(code, sizeof(code), s.start, s.done, s.slot, s.dest, s.player,
-                     reinterpret_cast<uint32_t>(&SiteSlotEntry));
-        WriteCode(s.start, code, sizeof(code));
+        SlotSiteCode(code, s.size, s.start, s.done, s.slot, s.dest, s.player, reinterpret_cast<uint32_t>(&SiteSlotEntry));
+        WriteCode(s.start, code, s.size);
     }
 
     // Whether one function's operand patches and slot site all match the client (each mismatch is logged).
@@ -1661,8 +1847,8 @@ namespace
                 ok = false;
             }
         for (const SlotSite& s : kSlotSites)
-            if (s.function == function && (memcmp(reinterpret_cast<const void*>(s.start), s.original, sizeof(s.original)) != 0 ||
-                                           s.start + sizeof(s.original) != s.nullLabel))
+            if (s.function == function && (memcmp(reinterpret_cast<const void*>(s.start), s.original, s.size) != 0 ||
+                                           s.start + s.size != s.nullLabel))
             {
                 AscLog::Printf("AscQuestLog64List: 0x%06X slot site at 0x%06X does not match", function, s.start);
                 ok = false;
@@ -1690,7 +1876,7 @@ namespace
     }
     bool InWatchGroup(uint32_t function) { return GroupOf(function) == kWatchGroup; }
 
-    // The distinct functions of `group`, in table order (the table has 23 on their own, 9 watch and 13 POI
+    // The distinct functions of `group`, in table order (the table has 24 on their own, 9 watch and 13 POI
     // functions); `max` is checked so a longer table fails loudly instead of skipping functions.
     uint32_t Functions(uint32_t* out, uint32_t max, Group group)
     {
@@ -1730,10 +1916,18 @@ namespace
         return true;
     }
 
+    bool HasListOperand(uint32_t function)
+    {
+        for (const OperandPatch& p : kOperandPatches)
+            if (p.function == function && (p.kind == kRows || p.kind == kCount || p.kind == kBound))
+                return true;
+        return false;
+    }
+
     // Each list function on its own, all or nothing; the watch functions as one group, all or nothing, after which
     // m_questWatches lives in s_watches (64); the POI functions likewise, after which m_questPOIs lives in s_pois
-    // (64). A mismatch anywhere in a group leaves that whole group on the client array (25 entries, list rows
-    // through the mirror).
+    // (64). A mismatch anywhere in a group leaves that whole group on the client array (25 entries). A function
+    // still reading m_quests after this (left unpatched) turns the copy-back on (s_mirrorNeeded, Sync).
     void PatchOperands()
     {
         uint32_t functions[64];
@@ -1742,7 +1936,20 @@ namespace
             if (FunctionMatches(functions[i]))
                 ApplyFunction(functions[i]);
             else
+            {
                 AscLog::Printf("AscQuestLog64List: 0x%06X left unpatched", functions[i]);
+                s_mirrorNeeded |= HasListOperand(functions[i]);
+            }
+
+        // Packet_Group_17's slot walk (own unit; it reads no list).
+        if (memcmp(reinterpret_cast<const void*>(kFailedSite), kFailedSiteOriginal, sizeof(kFailedSiteOriginal)) == 0)
+        {
+            uint8_t code[sizeof(kFailedSiteOriginal)];
+            FailedSiteCode(code, sizeof(code), kFailedSite, kFailedSiteDone, reinterpret_cast<uint32_t>(&QuestFailedInLog));
+            WriteCode(kFailedSite, code, sizeof(code));
+        }
+        else
+            AscLog::Printf("AscQuestLog64List: 0x6D8030 slot walk at 0x%06X does not match, left unpatched", kFailedSite);
 
         // Carry over what the client watch array holds (empty at load; the module initialises before the world).
         const uint32_t live = NumWatches() < AscQuestLog64::kNativeSlots ? NumWatches() : AscQuestLog64::kNativeSlots;
@@ -1753,9 +1960,14 @@ namespace
             memcpy(s_watches, carried, live * sizeof(Watch));
             s_watchesRelocated = true;
         }
+        else
+            s_mirrorNeeded = true;   // the watch functions also read m_quests
         // The POI array is not carried over: it is empty before the world, and its blobs are heap arrays that the
         // client's destructor would free a second time.
         s_poisRelocated = PatchGroup(kPoiGroup, "quest POI");
+        s_mirrorNeeded |= !s_poisRelocated;   // GetQuestWorldMapAreaID walks m_quests
+        if (s_mirrorNeeded)
+            AscLog::Printf("AscQuestLog64List: a function still reads m_quests; its first 50 rows are copied back");
     }
 
     // ---- MAX_QUESTLOG_QUESTS / MAX_WATCHABLE_QUESTS ------------------------------------------------------------
@@ -1816,6 +2028,7 @@ namespace
             {0x5E4FB0, reinterpret_cast<void*>(&Script_GetQuestIndexForTimer)},
             {0x5E2EB0, reinterpret_cast<void*>(&UpdatePOIIcons)},
             {0x5E3840, reinterpret_cast<void*>(&GetPOIQuestIDByVisibleIndex)},
+            {0x70F580, reinterpret_cast<void*>(&CanHighlight)},
         };
         for (const Replacement& r : replacements)
             AscRuntime::ReplaceFunction(r.address, r.fn);
@@ -1826,7 +2039,14 @@ namespace
 
         AscRuntime::OnStockEvent(kPlayerEnteringWorld, &SetInterfaceLimit);   // world entry and every /reload
         AscQuestLog64::OnChanged(&ApplyInterfaceLimit);
+        AscQuestLog64::OnChanged(&Refresh);
     }
     AscBindings::Module s_module(nullptr, 0, &Init);
+}
+
+const uint32_t* AscQuestLog64::QuestListRows(uint32_t& count)
+{
+    count = s_list.count;
+    return reinterpret_cast<const uint32_t*>(s_list.rows);
 }
 #endif
