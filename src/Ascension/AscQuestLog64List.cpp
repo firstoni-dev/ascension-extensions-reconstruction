@@ -5,9 +5,11 @@
 //
 // The list. The client's CGQuestLog::m_quests (0xC237B0, 50 x 16 bytes, count 0xC23AD0) and m_sortTypes (0xC23618,
 // 25 ints, count 0xC23AD4) are too small for 64 quests and their zone headers; the list below holds 128 rows and 64
-// sort types (as CoA64 sizes them). Client functions not yet ported still read the old arrays, so after every write
-// the first 50 rows and 25 sort types are copied back there with the counts clamped (Mirror): those readers see the
-// list as it was in a 25-quest log, and miss only rows 50+. Tasks 11-13 replace the remaining readers.
+// sort types (as CoA64 sizes them). Three techniques: functions with list logic or descriptor slot walks are ported;
+// functions that only index the list get their operands pointed at the DLL list (kOperandPatches); the four
+// leaderboard functions also get their one descriptor read replaced by a call (kSlotSites). The quest watch and POI
+// functions (Tasks 11 and 12) still read the old arrays, so after every write the first 50 rows and 25 sort types are
+// copied back there with the counts clamped (Mirror); those readers miss only rows 50+. See Sync for the list.
 //
 // The 25-bit collapse filter (cvar questLogCollapseFilter) is unchanged (spec non-goal): sort types past the 25th
 // have no collapse bit and always show expanded.
@@ -15,6 +17,7 @@
 
 #if ASCENSION_QUEST_LOG_64
 #include <Ascension/AscBindings.hpp>
+#include <Ascension/AscLog.hpp>
 #include <Ascension/AscLua.hpp>
 #include <Ascension/AscQuestLog64.hpp>
 #include <Ascension/AscRuntime.hpp>
@@ -24,6 +27,7 @@
 #include <cstring>
 #include <ctime>
 #include <initializer_list>
+#include <Windows.h>
 
 // The list itself, with no client access (tests/quest_log_64.py compiles this block).
 namespace AscQuestLog64List
@@ -174,6 +178,44 @@ namespace AscQuestLog64List
         memset(sortTypes, 0, kNativeSortTypes * sizeof(int32_t));
         memcpy(sortTypes, l.sortTypes, numSortTypes * sizeof(int32_t));
     }
+
+    // An operand that addressed the old list, pointed at the DLL list: 0xC23AD0 (the count) -> `count`, a row field
+    // 0xC237B0 + k -> `rows` + k.
+    uint32_t Relocated(uint32_t original, uint32_t rows, uint32_t count)
+    {
+        return original == 0xC23AD0 ? count : rows + (original - 0xC237B0);
+    }
+
+    enum X86Reg : uint8_t { kEax = 0, kEcx = 1, kEdx = 2, kEbx = 3, kEsi = 6, kEdi = 7 };
+
+    // The code replacing a slot site at `start` (`size` bytes, filled with nops after it):
+    //     push slot / push dword [ebp + player] / call target / add esp, 8 / [mov dest, eax] / jmp short done
+    // Returns the bytes used (16 at most).
+    uint32_t SlotSiteCode(uint8_t* code, uint32_t size, uint32_t start, uint32_t done, X86Reg slot, X86Reg dest, int8_t player,
+                          uint32_t target)
+    {
+        memset(code, 0x90, size);
+        uint32_t n = 0;
+        code[n++] = static_cast<uint8_t>(0x50 + slot);
+        code[n++] = 0xFF;
+        code[n++] = 0x75;
+        code[n++] = static_cast<uint8_t>(player);
+        code[n++] = 0xE8;
+        const uint32_t rel = target - (start + n + 4);
+        memcpy(code + n, &rel, 4);
+        n += 4;
+        code[n++] = 0x83;
+        code[n++] = 0xC4;
+        code[n++] = 0x08;
+        if (dest != kEax)
+        {
+            code[n++] = 0x8B;
+            code[n++] = static_cast<uint8_t>(0xC0 | (dest << 3));
+        }
+        code[n++] = 0xEB;
+        code[n] = static_cast<uint8_t>(done - (start + n + 1));
+        return n + 1;
+    }
 }
 
 namespace
@@ -248,11 +290,30 @@ namespace
             return nullptr;
         return AscQuestLog64::SlotEntry(fields ? fields - 0x250 : nullptr, slot);
     }
+
+    // 0x5E0870 CGPlayer::GetQuestLogEntry (thiscall, `self` = player + 0x1008; __fastcall with an unused edx has the
+    // same stack contract). 0..24 the descriptor; 25..63 the 0x8F7 store, which only holds the active player's log
+    // (the original's `slot > 25` let slot 25 read past the descriptor's log).
+    const uint8_t* __fastcall GetQuestLogEntry(const uint8_t* const* self, void*, int32_t slot)
+    {
+        if (slot < 0)
+            return nullptr;
+        if (slot < static_cast<int32_t>(AscQuestLog64::kNativeSlots))
+            return *self + 0x28 + slot * 0x14;
+        const uint8_t* active = Player();
+        if (!active || slot >= static_cast<int32_t>(kMaxSlots) ||
+            *reinterpret_cast<const uint8_t* const*>(active + 0x1008) != *self)
+            return nullptr;
+        return LogEntry(active, static_cast<uint32_t>(slot));
+    }
     uint32_t EntryQuest(const uint8_t* e) { return *reinterpret_cast<const uint32_t*>(e); }
     uint32_t EntryState(const uint8_t* e) { return *reinterpret_cast<const uint32_t*>(e + 4); }
     uint16_t EntryCount(const uint8_t* e, uint32_t i) { return *reinterpret_cast<const uint16_t*>(e + 8 + i * 2); }
     uint32_t EntryTime(const uint8_t* e) { return *reinterpret_cast<const uint32_t*>(e + 16); }
 
+    // The copy back into m_quests / m_sortTypes, for the readers not yet replaced: Task 11 (0x5DF610, 0x5DF700,
+    // 0x5DF780, 0x5DFC40, 0x5E64D0, 0x5E67C0, 0x5E6240, 0x5E4FB0) and Task 12 (0x5E2B60, 0x5E2EB0,
+    // 0x5E3840, 0x5E6650), and the DLL's AscAttachFixes QuestRelevant (Task 13). Remove once they are.
     void Sync() { Mirror(s_list, NativeRows(), NativeCount(), NativeSortTypes(), NativeNumSortTypes()); }
 
     const Row* QuestRow(int32_t index)
@@ -821,6 +882,204 @@ namespace
         return 1;
     }
 
+    // ---- operand patches: client functions that only index the list ------------------------------------------
+    //
+    // Instead of a port, every operand that addresses the old list is pointed at the DLL list: m_quests row
+    // fields (0xC237B0 + 0/4/8/0xC) -> s_list.rows + the same offset, the count 0xC23AD0 -> s_list.count, and each
+    // `cmp eax, 32h` (50 rows) bounding a row walk -> `cmp al, 80h` (128 rows; 128 does not fit a signed imm8, and
+    // every such site counts eax up from 0 by 1 and branches with jb, so the 8-bit unsigned compare is exact). The
+    // selection globals (0xC23AD8, 0xC23ADC) are not relocated. Each function's patches are applied only when every
+    // original operand matches; otherwise the function is left alone (it then reads the mirror) and the log says so.
+    // Table generated from IDA (2026-11-25); see the task 10 report.
+    enum OperandKind : uint8_t { kRows, kCount, kBound };
+    struct OperandPatch
+    {
+        uint32_t function;
+        uint32_t at;         // the operand's 4 bytes (kRows, kCount); the instruction (kBound)
+        uint32_t original;   // the operand's value (kBound: unused)
+        OperandKind kind;
+    };
+    const OperandPatch kOperandPatches[] = {
+        {0x5E1460, 0x5E150E, 0xC237B4, kRows},    // GetQuestLeaderBoardByID: mov edi, m_quests[].logSlot
+        {0x5E1460, 0x5E1A3B, 0xC237B0, kRows},    //   mov ecx, offset m_quests
+        {0x5E1460, 0x5E1A54, 0, kBound},          //   cmp eax, 32h
+        {0x5E1460, 0x5E1F37, 0xC237B0, kRows},    //   mov ecx, offset m_quests
+        {0x5E1460, 0x5E1F54, 0, kBound},          //   cmp eax, 32h
+        {0x5E20A0, 0x5E2147, 0xC237B4, kRows},    // GetQuestLogItemDropByID: mov esi, m_quests[].logSlot
+        {0x5E2370, 0x5E2401, 0xC23AD0, kCount},   // GetQuestLeaderBoardForObject
+        {0x5E2370, 0x5E240C, 0xC237B8, kRows},
+        {0x5E2370, 0x5E2415, 0xC237B4, kRows},
+        {0x5E2630, 0x5E26C1, 0xC23AD0, kCount},   // GetQuestLeaderBoardForItem
+        {0x5E2630, 0x5E26CC, 0xC237B8, kRows},
+        {0x5E2630, 0x5E26D5, 0xC237B4, kRows},
+        {0x5E1300, 0x5E1423, 0xC237B0, kRows},    // GetNumQuestLeaderBoards: mov ecx, offset m_quests
+        {0x5E1300, 0x5E1439, 0, kBound},          //   cmp eax, 32h
+        {0x5E0DA0, 0x5E0DAB, 0xC23AD0, kCount},   // GetQuestSpecialItem
+        {0x5E0DA0, 0x5E0DBD, 0xC237B8, kRows},
+        {0x5E0DA0, 0x5E0DC9, 0xC237B0, kRows},
+        {0x5E1250, 0x5E125E, 0xC23AD0, kCount},   // UpdateQuestItem
+        {0x5E1250, 0x5E126A, 0xC237B0, kRows},
+        {0x5E1250, 0x5E12AF, 0xC23AD0, kCount},
+        {0x5DF460, 0x5DF4A6, 0xC23AD0, kCount},   // Script_GetQuestLogRequiredMoney
+        {0x5DF460, 0x5DF4B1, 0xC237B8, kRows},
+        {0x5DF460, 0x5DF4BA, 0xC237B0, kRows},
+        {0x5DF520, 0x5DF55B, 0xC23AD0, kCount},   // Script_GetQuestLogPushable
+        {0x5DF520, 0x5DF566, 0xC237B8, kRows},
+        {0x5DF520, 0x5DF56F, 0xC237B0, kRows},
+        {0x5E06D0, 0x5E0719, 0xC23AD0, kCount},   // Script_GetQuestLogCompletionText
+        {0x5E06D0, 0x5E0724, 0xC237B8, kRows},
+        {0x5E06D0, 0x5E072D, 0xC237B0, kRows},
+        {0x5E3D60, 0x5E3EF4, 0xC23AD0, kCount},   // Script_GetAbandonQuestItems
+        {0x5E3D60, 0x5E3F09, 0xC237B0, kRows},
+        {0x5E3D60, 0x5E3FAD, 0xC23AD0, kCount},
+        {0x5E41A0, 0x5E420C, 0xC23AD0, kCount},   // Script_GetNumQuestLeaderBoards
+        {0x5E41A0, 0x5E4217, 0xC237B8, kRows},
+        {0x5E41A0, 0x5E4220, 0xC237B0, kRows},
+        {0x5E4260, 0x5E42CC, 0xC23AD0, kCount},   // Script_GetNumQuestItemDrops
+        {0x5E4260, 0x5E42D7, 0xC237B8, kRows},
+        {0x5E4260, 0x5E42E0, 0xC237B0, kRows},
+        {0x5E4ED0, 0x5E4F0C, 0xC23AD0, kCount},   // Script_QuestLogPushQuest
+        {0x5E4ED0, 0x5E4F17, 0xC237B8, kRows},
+        {0x5E4ED0, 0x5E4F20, 0xC237B0, kRows},
+        {0x5E51D0, 0x5E521B, 0xC23AD0, kCount},   // Script_GetQuestLink
+        {0x5E51D0, 0x5E522C, 0xC237B8, kRows},
+        {0x5E51D0, 0x5E5234, 0xC237B0, kRows},
+        {0x5E5F60, 0x5E602E, 0xC23AD0, kCount},   // Script_GetQuestLogLeaderBoard
+        {0x5E5F60, 0x5E6039, 0xC237B8, kRows},
+        {0x5E5F60, 0x5E6041, 0xC237B0, kRows},
+        {0x5E60D0, 0x5E619E, 0xC23AD0, kCount},   // Script_GetQuestLogItemDrop
+        {0x5E60D0, 0x5E61A9, 0xC237B8, kRows},
+        {0x5E60D0, 0x5E61B1, 0xC237B0, kRows},
+        {0x621070, 0x621EF9, 0xC23AD0, kCount},   // CGTooltip::SetUnit (then GetQuestAt, ported)
+        {0x621070, 0x6221FC, 0xC23AD0, kCount},
+        {0x626720, 0x626AD2, 0xC23AD0, kCount},   // CGTooltip::SetObject (then GetQuestAt, ported)
+        {0x626720, 0x626D43, 0xC23AD0, kCount},
+        {0x5E2950, 0x5E2963, 0xC237B0, kRows},    // ComputeBlobQuestObjectives: mov ecx, offset m_quests
+        {0x5E2950, 0x5E2976, 0, kBound},          //   cmp eax, 32h
+        {0x5E2950, 0x5E2982, 0xC23AD0, kCount},
+        {0x5E2950, 0x5E2992, 0xC237B8, kRows},
+        {0x5E2950, 0x5E29CD, 0xC237B4, kRows},    //   then GetQuestLogEntry (0x5E0870, replaced)
+        {0x5E2950, 0x5E29E5, 0xC237B0, kRows},
+    };
+    const uint8_t kBoundOriginal[3] = {0x83, 0xF8, 0x32};   // cmp eax, 32h
+    const uint8_t kBoundPatched[3] = {0x80, 0xF8, 0x80};    // cmp al, 80h
+
+    // The quest log entry the four leaderboard functions below read, for any slot (they keep their slot < 0 test).
+    const uint8_t* __cdecl SiteSlotEntry(const uint8_t* player, uint32_t slot)
+    {
+        return player && slot < kMaxSlots ? LogEntry(player, slot) : nullptr;
+    }
+
+    // ---- slot sites: the descriptor read inside the leaderboard functions ---------------------------------------
+    //
+    // GetQuestLeaderBoardByID, GetQuestLogItemDropByID, GetQuestLeaderBoardForObject and GetQuestLeaderBoardForItem
+    // each compute their log entry in one block:
+    //     cmp slot, 19h / ja null / mov r, player / mov r, [r+1008h] / lea / lea dest, [...] / jmp done / null: xor dest
+    // That block (from the cmp up to the null label, 23 bytes, no jump into it) becomes
+    //     push slot / push [ebp+player] / call SiteSlotEntry / add esp, 8 / mov dest, eax / jmp done / nops
+    // which clobbers eax, ecx and edx as the original block does. The rest of each function (3 KB for
+    // GetQuestLeaderBoardByID, with AscAttachLate's byte patches) runs unchanged.
+    struct SlotSite
+    {
+        uint32_t function, start, nullLabel, done;
+        X86Reg slot, dest;
+        int8_t player;          // [ebp + player]
+        uint8_t original[23];
+    };
+    const SlotSite kSlotSites[] = {
+        {0x5E1460, 0x5E1553, 0x5E156A, 0x5E156C, kEdi, kEdi, -4,
+         {0x83, 0xFF, 0x19, 0x77, 0x12, 0x8B, 0x55, 0xFC, 0x8B, 0x82, 0x08, 0x10, 0x00, 0x00, 0x8D, 0x4C, 0xBF, 0x0A,
+          0x8D, 0x3C, 0x88, 0xEB, 0x02}},
+        {0x5E20A0, 0x5E218C, 0x5E21A3, 0x5E21A5, kEsi, kEax, 0x0C,
+         {0x83, 0xFE, 0x19, 0x77, 0x12, 0x8B, 0x4D, 0x0C, 0x8B, 0x91, 0x08, 0x10, 0x00, 0x00, 0x8D, 0x44, 0xB6, 0x0A,
+          0x8D, 0x04, 0x82, 0xEB, 0x02}},
+        {0x5E2370, 0x5E241D, 0x5E2434, 0x5E2436, kEax, kEcx, 0x10,
+         {0x83, 0xF8, 0x19, 0x77, 0x12, 0x8B, 0x4D, 0x10, 0x8B, 0x91, 0x08, 0x10, 0x00, 0x00, 0x8D, 0x44, 0x80, 0x0A,
+          0x8D, 0x0C, 0x82, 0xEB, 0x02}},
+        {0x5E2630, 0x5E26DD, 0x5E26F4, 0x5E26F6, kEax, kEax, 0x10,
+         {0x83, 0xF8, 0x19, 0x77, 0x12, 0x8B, 0x4D, 0x10, 0x8B, 0x91, 0x08, 0x10, 0x00, 0x00, 0x8D, 0x44, 0x80, 0x0A,
+          0x8D, 0x04, 0x82, 0xEB, 0x02}},
+    };
+
+    void WriteCode(uint32_t at, const void* bytes, uint32_t size)
+    {
+        DWORD old;
+        if (!VirtualProtect(reinterpret_cast<void*>(at), size, PAGE_EXECUTE_READWRITE, &old))
+            return;
+        memcpy(reinterpret_cast<void*>(at), bytes, size);
+        VirtualProtect(reinterpret_cast<void*>(at), size, old, &old);
+        FlushInstructionCache(GetCurrentProcess(), reinterpret_cast<void*>(at), size);
+    }
+
+    bool OperandMatches(const OperandPatch& p)
+    {
+        if (p.kind == kBound)
+            return memcmp(reinterpret_cast<const void*>(p.at), kBoundOriginal, 3) == 0;
+        return memcmp(reinterpret_cast<const void*>(p.at), &p.original, 4) == 0;
+    }
+
+    void ApplyOperand(const OperandPatch& p)
+    {
+        if (p.kind == kBound)
+            return WriteCode(p.at, kBoundPatched, 3);
+        const uint32_t value = Relocated(p.original, reinterpret_cast<uint32_t>(s_list.rows),
+                                         reinterpret_cast<uint32_t>(&s_list.count));
+        WriteCode(p.at, &value, 4);
+    }
+
+    void ApplySlotSite(const SlotSite& s)
+    {
+        uint8_t code[sizeof(s.original)];
+        SlotSiteCode(code, sizeof(code), s.start, s.done, s.slot, s.dest, s.player,
+                     reinterpret_cast<uint32_t>(&SiteSlotEntry));
+        WriteCode(s.start, code, sizeof(code));
+    }
+
+    // Applies one function's operand patches and slot site, all or nothing.
+    void PatchFunction(uint32_t function)
+    {
+        bool ok = true;
+        for (const OperandPatch& p : kOperandPatches)
+            if (p.function == function && !OperandMatches(p))
+            {
+                AscLog::Printf("AscQuestLog64List: 0x%06X operand at 0x%06X does not match; function left unpatched",
+                               function, p.at);
+                ok = false;
+            }
+        for (const SlotSite& s : kSlotSites)
+            if (s.function == function && (memcmp(reinterpret_cast<const void*>(s.start), s.original, sizeof(s.original)) != 0 ||
+                                           s.start + sizeof(s.original) != s.nullLabel))
+            {
+                AscLog::Printf("AscQuestLog64List: 0x%06X slot site at 0x%06X does not match; function left unpatched",
+                               function, s.start);
+                ok = false;
+            }
+        if (!ok)
+            return;
+        for (const OperandPatch& p : kOperandPatches)
+            if (p.function == function)
+                ApplyOperand(p);
+        for (const SlotSite& s : kSlotSites)
+            if (s.function == function)
+                ApplySlotSite(s);
+    }
+
+    void PatchOperands()
+    {
+        uint32_t done[64] = {};
+        uint32_t count = 0;
+        for (const OperandPatch& p : kOperandPatches)
+        {
+            bool seen = false;
+            for (uint32_t i = 0; i < count; ++i)
+                seen |= done[i] == p.function;
+            if (seen || count == 64)
+                continue;
+            done[count++] = p.function;
+            PatchFunction(p.function);
+        }
+    }
+
     // ---- MAX_QUESTLOG_QUESTS / MAX_WATCHABLE_QUESTS ------------------------------------------------------------
 
     // FrameXML sets both to 25 when the interface loads; they follow the server's log size (25 without a packet).
@@ -874,12 +1133,14 @@ namespace
             {0x5E4320, reinterpret_cast<void*>(&Script_GetQuestLogTimeLeft)},
             {0x5E43F0, reinterpret_cast<void*>(&Script_IsCurrentQuestFailed)},
             {0x5E4070, reinterpret_cast<void*>(&Script_IsUnitOnQuest)},
+            {0x5E0870, reinterpret_cast<void*>(&GetQuestLogEntry)},   // also serves 0x5E58C0, 0x5E2950
         };
         for (const Replacement& r : replacements)
             AscRuntime::ReplaceFunction(r.address, r.fn);
         // push ebp / mov ebp,esp / push ecx / push ebx: five bytes.
         g_initializeGame = reinterpret_cast<InitializeGame_t>(
             AscRuntime::Detour(0x5E71A0, 5, reinterpret_cast<void*>(&InitializeGame)));
+        PatchOperands();
 
         AscRuntime::OnStockEvent(kPlayerEnteringWorld, &SetInterfaceLimit);   // world entry and every /reload
         AscQuestLog64::OnChanged(&ApplyInterfaceLimit);

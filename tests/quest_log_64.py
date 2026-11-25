@@ -289,6 +289,25 @@ int main()
     Mirror(small, native, nativeCount, nativeSort, nativeNumSort);
     Check(nativeCount == 2 && native[2].questId == 0 && native[49].isHeader == 0 && nativeSort[1] == 0,
           "Mirror: the rest zeroed");
+
+    Check(Relocated(0xC23AD0, 0x10000000, 0x20000000) == 0x20000000 && Relocated(0xC237B0, 0x10000000, 0) == 0x10000000
+          && Relocated(0xC237BC, 0x10000000, 0) == 0x1000000C, "Relocated: count and row fields");
+
+    // GetQuestLeaderBoardByID's site: slot edi, dest edi, player [ebp-4], 23 bytes at 0x5E1553, done 0x5E156C.
+    uint8_t site[23];
+    uint32_t used = SlotSiteCode(site, sizeof(site), 0x5E1553, 0x5E156C, kEdi, kEdi, -4, 0x10001000);
+    uint32_t rel;
+    memcpy(&rel, site + 5, 4);
+    Check(used == 16 && site[0] == 0x57 && site[1] == 0xFF && site[2] == 0x75 && site[3] == 0xFC && site[4] == 0xE8
+          && 0x5E1553 + 9 + rel == 0x10001000 && site[9] == 0x83 && site[10] == 0xC4 && site[11] == 0x08
+          && site[12] == 0x8B && site[13] == 0xF8 && site[14] == 0xEB && 0x5E1553 + 16 + site[15] == 0x5E156C
+          && site[16] == 0x90 && site[22] == 0x90, "SlotSiteCode: push edi / push [ebp-4] / call / add / mov edi,eax / jmp");
+    // GetQuestLeaderBoardForItem's: slot eax, dest eax, player [ebp+10h] -- no mov.
+    used = SlotSiteCode(site, sizeof(site), 0x5E26DD, 0x5E26F6, kEax, kEax, 0x10, 0x10001000);
+    Check(used == 14 && site[0] == 0x50 && site[3] == 0x10 && site[12] == 0xEB && 0x5E26DD + 14 + site[13] == 0x5E26F6,
+          "SlotSiteCode: dest eax needs no mov");
+    used = SlotSiteCode(site, sizeof(site), 0x5E241D, 0x5E2436, kEax, kEcx, 0x10, 0x10001000);
+    Check(used == 16 && site[12] == 0x8B && site[13] == 0xC8, "SlotSiteCode: mov ecx, eax");
     return failures ? 1 : 0;
 }
 '''
