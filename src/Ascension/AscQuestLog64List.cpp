@@ -783,14 +783,21 @@ namespace
     }
 
     // 0x5E0CC0 CGQuestLog::AbandonSelectedQuest: CMSG_QUESTLOG_REMOVE_QUEST (0x6D4F80) for the quest's slot.
+    // 0x6D4F80 is CGPlayer_C::RemoveQuest, __thiscall(player, slot), ret 4: the original pushes the row's whole +4
+    // dword and sets ecx to the player (mov ecx, eax). Its own body ignores ecx, but AscGossipQuest detours it as
+    // __fastcall(player, edx, slot) and reads player + 8, so a stray ecx crashed it (AV reading 0x0000000E).
     void __cdecl AbandonSelectedQuest()
     {
-        if (!Abandon() || !Player())
+        if (!Abandon())
+            return;
+        uint8_t* player = Player();
+        if (!player)
             return;
         for (uint32_t i = 0; i < kRows; ++i)
             if (!s_list.rows[i].isHeader && s_list.rows[i].questId == Abandon())
             {
-                reinterpret_cast<void(__stdcall*)(uint32_t)>(0x6D4F80)(static_cast<uint8_t>(s_list.rows[i].logSlot));
+                reinterpret_cast<void(__thiscall*)(void*, uint32_t)>(0x6D4F80)(
+                    player, static_cast<uint32_t>(s_list.rows[i].logSlot));
                 return;
             }
     }
@@ -1458,8 +1465,9 @@ namespace
             {
                 uint32_t guid[2];   // the player's own guid (descriptor +0)
                 memcpy(guid, *reinterpret_cast<const uint8_t* const*>(player + 8), 8);
-                // CGPlayer_C::CompleteQuest 0x6D4D40 (stdcall: guid*, quest id; ret 8)
-                reinterpret_cast<void(__stdcall*)(const uint32_t*, int32_t)>(0x6D4D40)(guid, Q<int32_t>(q, 0));
+                // CGPlayer_C::CompleteQuest 0x6D4D40 (__thiscall(player, guid*, quest id), ret 8: 0x6DF370 sets
+                // ecx = the player, mov ecx, ebx). Its body ignores ecx; the player is passed for any detour of it.
+                reinterpret_cast<void(__thiscall*)(void*, const uint32_t*, int32_t)>(0x6D4D40)(player, guid, Q<int32_t>(q, 0));
             }
         }
         if (decision.removePoi)

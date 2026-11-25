@@ -1,6 +1,7 @@
 import argparse
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import tempfile
@@ -19,6 +20,50 @@ def function(source, signature):
         depth += (source[index] == '{') - (source[index] == '}')
         index += 1
     return source[start:index]
+
+
+# The calling convention of every client function AscQuestLog64List.cpp calls, as the replaced client functions call
+# it (checked in IDA, 2026-11-25: ecx set by the caller, retn N of the callee). A __thiscall callee that the DLL
+# also detours as __fastcall(this, edx, ...) reads ecx even where the client body does not (0x6D4F80, AscGossipQuest).
+CLIENT_CONVENTIONS = {
+    0x4D3790: '__cdecl', 0x4D4DB0: '__cdecl', 0x67DE90: '__thiscall', 0x65C290: '__thiscall', 0x766940: '__thiscall',
+    0x615020: '__cdecl', 0x6D50C0: '__cdecl', 0x76EC80: '__stdcall', 0x5D05B0: '__cdecl', 0x51A2B0: '__thiscall',
+    0x754D00: '__thiscall', 0x5DEC70: '__cdecl', 0x7F4930: '__cdecl', 0x5DEB60: '__cdecl', 0x6D4F80: '__thiscall',
+    0x5E28B0: '__cdecl', 0x5DFDC0: '__cdecl', 0x5E65B0: '__cdecl', 0x5DEA60: '__cdecl', 0x5E0D20: '__cdecl',
+    0x767440: '__cdecl', 0x60C1C0: '__cdecl', 0x52C680: '__cdecl', 0x5E0870: '__thiscall', 0x5216F0: '__cdecl',
+    0x543770: '__cdecl', 0x5E0180: '__cdecl', 0x5E0110: '__cdecl', 0x5E2900: '__cdecl', 0x746190: '__cdecl',
+    0x530840: '__cdecl', 0x5222B0: '__cdecl', 0x81B530: '__cdecl', 0x6D4D40: '__thiscall', 0x5DEC10: '__cdecl',
+}
+
+
+def check_client_calls(source):
+    # Every reinterpret_cast of a client address to a function pointer, direct or through a typedef, against the
+    # table; an address missing from it is a call site nobody audited. Returns the failure count.
+    typedef = r'typedef\s+[^;()]+\(\s*(__\w+)\s*\*\s*(\w+)\s*\)'
+    typedefs = {name: convention for convention, name in re.findall(typedef, source)}
+    found = {}
+    for convention, address in re.findall(r'reinterpret_cast<[^<>;]*?\(\s*(__\w+)\s*\*\s*\)[^<>;]*>\(\s*(0x[0-9A-Fa-f]+)\)',
+                                          source):
+        found.setdefault(int(address, 16), set()).add(convention)
+    for name, address in re.findall(r'reinterpret_cast<(\w+_t)>\(\s*(0x[0-9A-Fa-f]+)\)', source):
+        if name in typedefs:
+            found.setdefault(int(address, 16), set()).add(typedefs[name])
+    failures = 0
+    for address, conventions in sorted(found.items()):
+        if address == 0x5E71A0:   # InitializeGame: the Detour trampoline, called as the port itself is declared
+            continue
+        ok = conventions == {CLIENT_CONVENTIONS.get(address)}
+        failures += not ok
+        print('%s: client call 0x%06X as %s' % ('PASS' if ok else 'FAIL', address, '/'.join(sorted(conventions))))
+    missing = sorted(set(CLIENT_CONVENTIONS) - set(found))
+    failures += bool(missing)
+    print('%s: every audited client callee is still called (%s)' % (
+        'FAIL' if missing else 'PASS', ', '.join('0x%06X' % a for a in missing) or 'all'))
+    abandon = function(source, 'void __cdecl AbandonSelectedQuest()')
+    ok = re.search(r'\(__thiscall\*\)\(void\*, uint32_t\)>\(0x6D4F80\)\(\s*player,', abandon) is not None
+    failures += not ok
+    print('%s: AbandonSelectedQuest calls 0x6D4F80 with the player in ecx' % ('PASS' if ok else 'FAIL'))
+    return failures
 
 
 HARNESS = r'''
@@ -505,6 +550,7 @@ def main():
     harness = harness.replace('@HELLO@', function(cpp_source, 'void SendHello()'))
     list_source = (ROOT / 'src/Ascension/AscQuestLog64List.cpp').read_text(encoding='utf-8')
     harness = harness.replace('@LIST@', function(list_source, 'namespace AscQuestLog64List'))
+    static_failures = check_client_calls(list_source)
     compiler = shutil.which(os.environ.get('CXX', 'cl.exe' if os.name == 'nt' else 'c++'))
     if not compiler:
         raise SystemExit('A C++20 compiler is required.')
@@ -519,7 +565,7 @@ def main():
             flags = ['-std=c++20', '-Wall', '-Wextra', '-Werror', '-Wno-unused-parameter',
                      str(cpp), '-o', str(executable)]
         subprocess.run([compiler, *flags], cwd=out, check=True)
-        return subprocess.run([str(executable)], cwd=out).returncode
+        return subprocess.run([str(executable)], cwd=out).returncode or (1 if static_failures else 0)
 
 
 if __name__ == '__main__':
