@@ -34,6 +34,17 @@ namespace AscQuestLog64
     };
     // While OnChanged runs: the slots the packet changed, in slot order. None for the first packet after Clear.
     const std::vector<Change>& Changes();
+    // While OnChanged runs: true for the first packet after Clear (the login snapshot).
+    bool FirstSinceClear();
+
+    // OnUpdateQuest's per-slot decisions for `slot`, from the quest ids now in slots 0..63 (`ids`) and the slot's
+    // entry before the change. A quest another slot still holds has moved (the server's promotion): no accept, no drop.
+    struct SlotDecision
+    {
+        bool accepted;    // "Quest accepted": message, tutorials, QUEST_ACCEPTED
+        bool removePoi;   // RemoveQuestPointDisplay(oldQuest)
+    };
+    SlotDecision DecideSlot(const uint32_t* ids, uint32_t slot, uint32_t state, uint32_t oldQuest, uint32_t oldState);
 
     // The client's quest log entry for `slot` (0x14 bytes: u32 questId, u32 state, u16 counts[4], u32 time):
     // descriptor + 0x278 + slot * 0x14 for 0..24, a mirror refreshed from the store on every call (zeroed when the
@@ -59,6 +70,7 @@ namespace AscQuestLog64
     // Parses and applies one SMSG 0x8F7 body; false (and nothing applied) when it is malformed.
     bool Apply(const uint8_t* data, uint32_t size);
     // The store emptied and LogSize back to kNativeSlots.
+    // No refresh: InitializeGame empties the list on the glue screen and world entry rebuilds it.
     void Clear();
 }
 #endif

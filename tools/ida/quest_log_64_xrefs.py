@@ -82,10 +82,6 @@ HARMLESS = {
     0x9CB280: dict(name="static constructor of m_questPOIs", sites=None, span=0x30,
                    reason="CRT initialiser of the old array, run before the DLL loads; that array is unused once the "
                           "POI group is relocated, and s_pois starts zeroed as this constructor would leave it"),
-    0x6DF370: dict(name="OnUpdateQuest", sites=None,
-                   reason="descriptor-change handler: the slot comes from the changed descriptor field, so it is "
-                          "always 0..24 (verified: (offset - 28h) / 14h, `cmp edx, 19h`); slots 25..63 change "
-                          "through SMSG 0x8F7 and AscQuestLog64 Refresh / SlotUpdated"),
 }
 
 # Display names for rows whose function is in no table.

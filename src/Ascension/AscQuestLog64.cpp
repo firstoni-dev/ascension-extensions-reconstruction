@@ -48,6 +48,7 @@ namespace AscQuestLog64
         std::vector<void (*)()> s_changed;
         std::vector<Change> s_changes;
         bool s_filled = false;   // a packet has arrived since the last Clear
+        bool s_first = false;    // the packet being applied is the first since the last Clear
         uint8_t s_mirror[kMirrored][0x14];
 
         struct Parsed
@@ -78,6 +79,29 @@ namespace AscQuestLog64
     void OnChanged(void (*cb)()) { s_changed.push_back(cb); }
 
     const std::vector<Change>& Changes() { return s_changes; }
+
+    bool FirstSinceClear() { return s_first; }
+
+    namespace
+    {
+        bool InOtherSlot(const uint32_t* ids, uint32_t slot, uint32_t questId)
+        {
+            for (uint32_t i = 0; i < kMaxSlots; ++i)
+                if (i != slot && ids[i] == questId)
+                    return true;
+            return false;
+        }
+    }
+
+    SlotDecision DecideSlot(const uint32_t* ids, uint32_t slot, uint32_t state, uint32_t oldQuest, uint32_t oldState)
+    {
+        const uint32_t quest = ids[slot];
+        const bool movedIn = quest && quest != oldQuest && InOtherSlot(ids, slot, quest);
+        SlotDecision d;
+        d.accepted = quest && !movedIn && (quest != oldQuest || (!(state & 2) && (oldState & 2)));
+        d.removePoi = oldQuest && quest != oldQuest && !InOtherSlot(ids, slot, oldQuest);
+        return d;
+    }
 
     const uint8_t* SlotEntry(const uint8_t* descriptor, uint32_t slot)
     {
@@ -205,6 +229,7 @@ namespace AscQuestLog64
         }
 
         s_changes.clear();
+        s_first = !s_filled;
         if (s_filled)
             for (uint32_t i = kNativeSlots; i < kMaxSlots; ++i)
                 if (memcmp(&before[i].entry, &s_slots[i].entry, sizeof(Entry)) != 0)
@@ -217,6 +242,7 @@ namespace AscQuestLog64
         for (void (*cb)() : s_changed)
             cb();
         s_changes.clear();
+        s_first = false;
         return true;
     }
 
@@ -226,6 +252,7 @@ namespace AscQuestLog64
             s = Slot();
         s_logSize = kNativeSlots;
         s_filled = false;
+        s_first = false;
     }
 }
 

@@ -17,8 +17,8 @@ missed. It also holds the in-game checklist for the user.
 ## Audit result
 
 Run on 2026-11-25 against `D:\WoW\Coa-Dev\Ascension.exe` (MD5 `d7c1f84725331dda38fa2e134cfad61a`, IDA 9.5 database)
-and the source at `029487e`. The run exits with status 0: no reference is UNCOVERED, and no table entry fails to match
-the binary.
+and the source of the final review fixes (on `505152e`; OnUpdateQuest 0x6DF370 now replaced). The run exits with
+status 0: no reference is UNCOVERED, and no table entry fails to match the binary.
 
 Classes:
 
@@ -29,11 +29,11 @@ Classes:
 - **UNCOVERED:** anything else.
 
 <!-- generated: tools/ida/quest_log_64_xrefs.py output below -->
-Covered set read from AscQuestLog64.cpp, AscQuestLog64List.cpp: 177 operand patches, 5 slot sites, 1 failed-quest site, 33 replaced functions, 1 detours in AscQuestLog64*, 234 detours elsewhere.
+Covered set read from AscQuestLog64.cpp, AscQuestLog64List.cpp: 177 operand patches, 5 slot sites, 1 failed-quest site, 34 replaced functions, 1 detours in AscQuestLog64*, 234 detours elsewhere.
 
 Ranges: m_sortTypes[25] 0xC23618..0xC2367B; m_questWatches[25] 0xC23680..0xC237AB; m_quests[50] / count / numSortTypes 0xC237B0..0xC23AD7; m_questPOIs[25] 0xC23B00..0xC23FAF; descriptor quest slots desc+0x278..+0x46B.
 
-Result: UNCOVERED 0, detoured 32, operand-patched 47, harmless 3, problems 0.
+Result: UNCOVERED 0, detoured 33, operand-patched 47, harmless 2, problems 0.
 
 | Function | Name | References | # | Class | Reason |
 |---|---|---|---|---|---|
@@ -116,7 +116,7 @@ Result: UNCOVERED 0, detoured 32, operand-patched 47, harmless 3, problems 0.
 | 0x626720 | CGTooltip::SetObject | m_quests[50] / count / numSortTypes | 2 | operand-patched | 2 site(s) patched |
 | 0x6D7DE0 | CGPlayer_C::CheckForQuestItemLoot | descriptor slots | 1 | operand-patched | 1 site(s) patched |
 | 0x6D8030 | Packet_Group_17 (SMSG_QUESTUPDATE_*) | descriptor slots | 1 | operand-patched | 1 site(s) patched |
-| 0x6DF370 | OnUpdateQuest | descriptor slots | 1 | harmless | descriptor-change handler: the slot comes from the changed descriptor field, so it is always 0..24 (verified: (offset - 28h) / 14h, `cmp edx, 19h`); slots 25..63 change through SMSG 0x8F7 and AscQuestLog64 Refresh / SlotUpdated |
+| 0x6DF370 | OnUpdateQuest | descriptor slots | 1 | detoured | ReplaceFunction -> OnUpdateQuest |
 | 0x70F580 | CanHighlight | descriptor slots | 1 | detoured | ReplaceFunction -> CanHighlight |
 | nofunc 0x9CB285 | static constructor of m_questPOIs | m_questPOIs[25] | 1 | harmless | CRT initialiser of the old array, run before the DLL loads; that array is unused once the POI group is relocated, and s_pois starts zeroed as this constructor would leave it |
 
@@ -129,7 +129,6 @@ Result: UNCOVERED 0, detoured 32, operand-patched 47, harmless 3, problems 0.
 - 0x5E2630 GetQuestLeaderBoardForItem: 0x5E26BF m_quests[50] / count / numSortTypes 0xC23AD0; 0x5E26CA m_quests[50] / count / numSortTypes 0xC237B8; 0x5E26D3 m_quests[50] / count / numSortTypes 0xC237B4; 0x5E26EF lea desc+278h indexed
 - 0x6D7DE0 CGPlayer_C::CheckForQuestItemLoot: 0x6D7E32 add desc+278h indexed
 - 0x6D8030 Packet_Group_17 (SMSG_QUESTUPDATE_*): 0x6D8091 add desc+278h indexed
-- 0x6DF370 OnUpdateQuest: 0x6DF3E4 lea desc+278h indexed
 - nofunc 0x9CB285 static constructor of m_questPOIs: 0x9CB285 m_questPOIs[25] 0xC23B0C
 <!-- end of generated output -->
 
@@ -223,3 +222,5 @@ Mark each line PASS or FAIL, with a note.
 | 22 | Quest links (shift-click) for quests in slots 25..63 show the right level and XP | |
 | 23 | Zone headers 1–25 collapse and expand; headers past the 25th zone always show expanded (spec non-goal) | |
 | 24 | Built with `-DASCENSION_QUEST_LOG_64=OFF` (`cmake -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DASCENSION_QUEST_LOG_64=OFF -S . -B out\off`), against the same ql64 server: the genuine behaviour. The log holds 25 quests, the counter reads n/25, quests past 25 are in the Extra Quests window, and no CMSG `0x8F6` is sent | |
+| 25 | Track a quest in slot 26+, log out and back in: it is still tracked | |
+| 26 | With 30 quests and auto quest watch off, track quest #30 and turn in quest #1: no "Quest accepted", and #30 is still tracked | |

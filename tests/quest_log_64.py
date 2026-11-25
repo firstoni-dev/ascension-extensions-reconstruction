@@ -223,7 +223,7 @@ int main()
           && seen[1].slot == 32 && seen[1].old.questId == 0, "Changes: slots 31 and 32 with their old entries");
     Check(AscQuestLog64::Changes().empty(), "Changes empty outside a callback");
 
-    // ---- Task 13: the DLL's readers over 64 slots ----
+    // ---- the DLL's readers over 64 slots (docs/QUEST_LOG_64.md) ----
     Setup();
     static uint8_t qdesc[0x278 + 25 * 0x14];
     memset(qdesc, 0, sizeof(qdesc));
@@ -348,7 +348,7 @@ int main()
     used = SlotSiteCode(site, sizeof(site), 0x5E241D, 0x5E2436, kEax, kEcx, 0x10, 0x10001000);
     Check(used == 16 && site[12] == 0x8B && site[13] == 0xC8, "SlotSiteCode: mov ecx, eax");
 
-    // Task 11: the watch array (0xC23680, 25 x 12 bytes) moves to the DLL; its bounds go 25 -> 64.
+    // Watches: the watch array (0xC23680, 25 x 12 bytes) moves to the DLL; its bounds go 25 -> 64.
     Check(sizeof(Watch) == 12, "Watch: 12 bytes, as m_questWatches");
     Check(RelocatedWatch(0xC23680, 0x10000000) == 0x10000000 && RelocatedWatch(0xC23684, 0x10000000) == 0x10000004
           && RelocatedWatch(0xC23688, 0x10000000) == 0x10000008, "RelocatedWatch: base and fields");
@@ -362,7 +362,7 @@ int main()
     Check(TimerLeft(100, 50, 140) == 9 && TimerLeft(0, 50, 51) == -2 && TimerLeft(10, 0x7FFFFFF0, 0) > 0,
           "TimerLeft: offset + time - now - 1");
 
-    // Task 12: m_questPOIs (0xC23B00, 25 x 0x30 bytes) moves to the DLL (64); UpdatePOIIcons' layout over 64.
+    // POIs: m_questPOIs (0xC23B00, 25 x 0x30 bytes) moves to the DLL (64); UpdatePOIIcons' layout over 64.
     Check(sizeof(Poi) == 0x30 && offsetof(Poi, blobCount) == 8 && offsetof(Poi, blobData) == 0x0C
           && offsetof(Poi, iconX) == 0x20 && offsetof(Poi, visible) == 0x28 && offsetof(Poi, objectiveMask) == 0x2C,
           "Poi: 0x30 bytes, as m_questPOIs");
@@ -412,7 +412,7 @@ int main()
     Check(pois[26].iconX == 100 && pois[26].iconY == 0 && pois[40].iconX == 125 && pois[40].iconY == 43
           && pois[63].iconX == 9000 && pois[63].iconY == 0, "ShiftComplete: stacked completed icons fan out past slot 25");
 
-    // Task 13: the world checks and the refresh decisions.
+    // World checks and the refresh decisions.
     Check(SlotBytesBound(0x21C) == 0x528 && SlotBytesBound(0x200) == 0, "SlotBytesBound: 0x28 + 25 * 0x14 -> 0x28 + 64 * 0x14");
     // CheckForQuestItemLoot's site: slot eax, dest esi, player [ebp-0Ch], 20 bytes at 0x6D7E20, done = its end.
     used = SlotSiteCode(site, 20, 0x6D7E20, 0x6D7E34, kEax, kEsi, -0x0C, 0x10001000);
@@ -428,10 +428,68 @@ int main()
           && failed[12] == 0x8B && failed[13] == 0xD8 && failed[14] == 0xEB && 0x6D807A + 16 + failed[15] == 0x6D80B9
           && failed[16] == 0x90 && failed[59] == 0x90,
           "FailedSiteCode: mov edi, [ebp-4] / push edi / call / add esp, 4 / mov ebx, eax / jmp");
-    Check(AcceptedChange(40, 0, 0, 0) && AcceptedChange(40, 0, 39, 0) && AcceptedChange(40, 0, 40, 2)
-          && !AcceptedChange(40, 1, 40, 0) && !AcceptedChange(40, 2, 40, 2) && !AcceptedChange(0, 0, 40, 0),
-          "AcceptedChange: a new quest or a failure lifted; not a counter change or a removal");
-    Check(LeftSlot(0, 40) && LeftSlot(41, 40) && !LeftSlot(40, 40) && !LeftSlot(40, 0), "LeftSlot: the old quest left the slot");
+    {
+        using AscQuestLog64::DecideSlot;
+        uint32_t log[64] = {};
+        log[30] = 600;
+        AscQuestLog64::SlotDecision d = DecideSlot(log, 30, 0, 0, 0);
+        bool ok = d.accepted && !d.removePoi;
+        d = DecideSlot(log, 30, 0, 599, 0);
+        ok &= d.accepted && d.removePoi;
+        d = DecideSlot(log, 30, 0, 600, 2);
+        ok &= d.accepted && !d.removePoi;
+        d = DecideSlot(log, 30, 1, 600, 0);
+        ok &= !d.accepted && !d.removePoi;
+        d = DecideSlot(log, 30, 2, 600, 2);
+        ok &= !d.accepted;
+        log[30] = 0;
+        d = DecideSlot(log, 30, 0, 600, 0);
+        ok &= !d.accepted && d.removePoi;
+        Check(ok, "DecideSlot: a new quest or a failure lifted is accepted; a removal drops the POI");
+
+        // Promotion from slot 40 into native slot 3: the descriptor first, then 0x8F7 empties slot 40.
+        uint32_t promo[64] = {};
+        promo[3] = promo[40] = 500;
+        d = DecideSlot(promo, 3, 0, 0, 0);
+        ok = !d.accepted && !d.removePoi;
+        promo[40] = 0;
+        d = DecideSlot(promo, 40, 0, 500, 0);
+        ok &= !d.accepted && !d.removePoi;
+        Check(ok, "DecideSlot: a quest still in another slot moved; no accept, no POI removal");
+
+        // A timed quest 800 pinned to slot 3: its quest 500 moves to slot 30 first, then slot 3 gets 800.
+        uint32_t pin[64] = {};
+        pin[3] = pin[30] = 500;
+        d = DecideSlot(pin, 30, 0, 0, 0);
+        ok = !d.accepted && !d.removePoi;
+        pin[3] = 800;
+        d = DecideSlot(pin, 3, 0, 500, 0);
+        ok &= d.accepted && !d.removePoi;
+        Check(ok, "DecideSlot: a pinned timed quest is accepted, the quest it displaced is not");
+    }
+
+    // The refresh reloads the saved watches on the login snapshot: the first packet after Clear.
+    Setup();
+    static std::vector<bool> firsts;
+    AscQuestLog64::OnChanged([] { firsts.push_back(AscQuestLog64::FirstSinceClear()); });
+    Bytes p1;
+    p1.U8(1).U8(1).U8(64).U8(1);
+    Add(p1, 30, 100);
+    Bytes p2;
+    p2.U8(1).U8(0).U8(64).U8(1);
+    Add(p2, 31, 101);
+    Bytes bad;
+    bad.U8(2).U8(1).U8(64).U8(1);
+    Add(bad, 30, 100);
+    Feed(p1);
+    bool outside = !AscQuestLog64::FirstSinceClear();
+    Feed(p2);
+    Feed(p1);
+    AscQuestLog64::Clear();
+    Feed(bad);
+    Feed(p2);
+    Check(outside && firsts == std::vector<bool>({true, false, false, true}),
+          "FirstSinceClear: the first applied packet after Clear only, false outside a callback");
     return failures ? 1 : 0;
 }
 '''

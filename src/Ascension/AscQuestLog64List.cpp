@@ -11,14 +11,14 @@
 // AscQuestLog64::QuestListRows. Only when a function stays unpatched (bytes not matching) are the first 50 rows and 25
 // sort types copied back into the old arrays (Mirror; see Sync).
 //
-// World checks and the refresh (Task 13). CheckForQuestItemLoot gets a slot site and a 64-slot bound,
+// World checks and the refresh. CheckForQuestItemLoot gets a slot site and a 64-slot bound,
 // Packet_Group_17 its slot walk replaced by a call, CanHighlight is ported; after every 0x8F7 Refresh runs what
 // OnUpdateQuest (0x6DF370) runs for a quest update-field change, for the changed slots 25..63.
 //
-// The watches (Task 11). CGQuestLog::m_questWatches (0xC23680, 25 x 12 bytes) moves to s_watches (64) by the same
+// The watches. CGQuestLog::m_questWatches (0xC23680, 25 x 12 bytes) moves to s_watches (64) by the same
 // operand patches, applied to the watch functions as one group; the timer Lua functions are ported.
 //
-// The POIs (Task 12). CGQuestLog::m_questPOIs (0xC23B00, 25 x 0x30 bytes) moves to s_pois (64) the same way, as a
+// The POIs. CGQuestLog::m_questPOIs (0xC23B00, 25 x 0x30 bytes) moves to s_pois (64) the same way, as a
 // second group; UpdatePOIIcons (stack arrays of 25) and GetPOIQuestIDByVisibleIndex are ported.
 //
 // The 25-bit collapse filter (cvar questLogCollapseFilter) is unchanged (spec non-goal): sort types past the 25th
@@ -268,7 +268,7 @@ namespace AscQuestLog64List
         return n + 1;
     }
 
-    // Task 13. A descriptor slot walk bounded by its byte offset, `cmp r, 21Ch` (0x28 + 25 * 0x14: the end of
+    // Slot sites. A descriptor slot walk bounded by its byte offset, `cmp r, 21Ch` (0x28 + 25 * 0x14: the end of
     // m_playerQuestLog behind player + 0x1008) -> 0x528 (64 slots; the entries past 25 come from SiteSlotEntry). 0
     // for any other value.
     uint32_t SlotBytesBound(uint32_t original)
@@ -295,15 +295,6 @@ namespace AscQuestLog64List
         code[n] = static_cast<uint8_t>(done - (start + n + 1));
         return n + 1;
     }
-
-    // OnUpdateQuest's (0x6DF370) per-slot decisions, from the slot's entry before and after the change.
-    // "Quest accepted" (message, tutorials, QUEST_ACCEPTED): a new quest, or a failed one no longer failed.
-    bool AcceptedChange(uint32_t quest, uint32_t state, uint32_t oldQuest, uint32_t oldState)
-    {
-        return quest && (quest != oldQuest || (!(state & 2) && (oldState & 2)));
-    }
-    // The old quest's point display is removed when the slot now holds another quest.
-    bool LeftSlot(uint32_t quest, uint32_t oldQuest) { return oldQuest && quest != oldQuest; }
 
     // CGQuestLog::m_questPOIs entry (0xC23B00, 25 of them); the DLL keeps 64 (CoA64 m_questPOIs). `blob*` is the
     // TSGrowableArray<QuestPOIBlob> (0x34-byte blobs; the client allocates them, ShutdownGame frees them).
@@ -1127,7 +1118,7 @@ namespace
         return 1;
     }
 
-    // ---- quest timers (Task 11) ----------------------------------------------------------------------------------
+    // ---- quest timers -----------------------------------------------------------------------------------------------
 
     // The running timed quest at list row `i`: its log entry, or nullptr (header, slot outside 0..63, no timer, failed).
     const uint8_t* TimedEntry(uint8_t* player, uint32_t i)
@@ -1208,7 +1199,7 @@ namespace
         return 1;
     }
 
-    // ---- POIs (Task 12) ----------------------------------------------------------------------------------------
+    // ---- POIs -------------------------------------------------------------------------------------------------------
 
     // An inline WowClientDB::GetRecord as UpdatePOIIcons does it: the table's min id at `minAt`, the max id 4 bytes
     // before it, the row pointers 0x10 after it.
@@ -1390,7 +1381,7 @@ namespace
         return -1;
     }
 
-    // ---- Task 13: world checks -----------------------------------------------------------------------------------
+    // ---- world checks -----------------------------------------------------------------------------------------------
 
     // 0x70F580 CGGameObject_C::CanHighlight (thiscall, no argument; __fastcall with an unused edx has the same
     // contract): an object with a quest (its stats' id for the lock type) is highlighted only while that quest is in
@@ -1419,16 +1410,27 @@ namespace
         return 0;
     }
 
-    // ---- Task 13: the refresh after SMSG 0x8F7 -------------------------------------------------------------------
+    // ---- the refresh after SMSG 0x8F7 -------------------------------------------------------------------------------
 
-    // OnUpdateQuest's (0x6DF370) per-slot half (CoA64 QuestLogSlotUpdated) for a slot of 25..63, with its entry
-    // before the packet (`old`, 0x14 bytes). The client's own OnUpdateQuest keeps serving descriptor slots 0..24.
+    // OnUpdateQuest's (0x6DF370) per-slot half (CoA64 QuestLogSlotUpdated) for a slot of 0..63, with its entry
+    // before the change (`old`, 0x14 bytes). AscQuestLog64::DecideSlot: a quest another slot still holds has moved.
     void SlotUpdated(uint8_t* player, uint32_t slot, const uint8_t* old)
     {
+        uint32_t ids[kMaxSlots];
+        for (uint32_t i = 0; i < kMaxSlots; ++i)
+        {
+            const uint8_t* e = LogEntry(player, i);
+            ids[i] = e ? EntryQuest(e) : 0;
+        }
         const uint8_t* entry = LogEntry(player, slot);
         if (!entry)
             return;
-        if (AcceptedChange(EntryQuest(entry), EntryState(entry), EntryQuest(old), EntryState(old)))
+        const uint8_t none[0x14] = {};
+        if (!old)
+            old = none;
+        const AscQuestLog64::SlotDecision decision =
+            AscQuestLog64::DecideSlot(ids, slot, EntryState(entry), EntryQuest(old), EntryState(old));
+        if (decision.accepted)
         {
             // 0x6DF2B0 QuestAcceptCallback (runs the same block once the record arrives)
             if (const uint8_t* q = Quest(static_cast<int32_t>(EntryQuest(entry)), 0x6DF2B0))
@@ -1460,8 +1462,25 @@ namespace
                 reinterpret_cast<void(__stdcall*)(const uint32_t*, int32_t)>(0x6D4D40)(guid, Q<int32_t>(q, 0));
             }
         }
-        if (LeftSlot(EntryQuest(LogEntry(player, slot)), EntryQuest(old)))
+        if (decision.removePoi)
             reinterpret_cast<void(__cdecl*)(uint32_t)>(0x5DEC10)(EntryQuest(old));   // RemoveQuestPointDisplay
+    }
+
+    // 0x6DF370 OnUpdateQuest, the mirror handler of descriptor slots 0..24 (cdecl: guid, field offset, count, the
+    // entry before the change, param; returns 1). Ported so a promotion into a native slot is a move here too.
+    int __cdecl OnUpdateQuest(uint32_t guidLo, uint32_t guidHi, uint32_t offset, uint32_t, const uint8_t* old, void*)
+    {
+        uint8_t* player = reinterpret_cast<uint8_t*(__cdecl*)(uint32_t, uint32_t, uint32_t, const char*, int)>(0x4D4DB0)(
+            guidLo, guidHi, kTypePlayer, kFile, 0);   // ClntObjMgrObjectPtr
+        if (!player)
+            return 1;
+        const uint64_t active = reinterpret_cast<uint64_t(__cdecl*)()>(0x4D3790)();   // ClntObjMgrGetActivePlayer
+        const uint32_t* guid = *reinterpret_cast<const uint32_t* const*>(player + 8);
+        if (guid[0] == static_cast<uint32_t>(active) && guid[1] == static_cast<uint32_t>(active >> 32))
+            QueryQuestGiverStatus();
+        Update(1);
+        SlotUpdated(player, (offset - 0x28) / 0x14, old);
+        return 1;
     }
 
     // After every applied 0x8F7 (CoA64 QuestLogExtendedClient Refresh): what OnUpdateQuest runs once for the packet
@@ -1479,6 +1498,15 @@ namespace
         Update(1);
         if (pending)
             Signal(kQuestLogUpdate);
+        // World entry's LoadTrackedQuests ran before slots 25..63 arrived, so their saved watches were refused. Load
+        // them again (AddQuestWatch skips duplicates), or let Update(1) do it once the pending quest records arrive.
+        if (AscQuestLog64::FirstSinceClear())
+        {
+            if (CallbackCount())
+                TrackedLoaded() = 0;
+            else
+                reinterpret_cast<int(__cdecl*)()>(0x5E65B0)();   // CGQuestLog::LoadTrackedQuests
+        }
         for (const AscQuestLog64::Change& c : AscQuestLog64::Changes())
         {
             uint8_t old[0x14];
@@ -1498,21 +1526,21 @@ namespace
     // every such site counts eax up from 0 by 1 and branches with jb, so the 8-bit unsigned compare is exact). The
     // selection globals (0xC23AD8, 0xC23ADC) are not relocated. Each function's patches are applied only when every
     // original operand matches; otherwise the function is left alone (it then reads the mirror) and the log says so.
-    // Table generated from IDA (2026-11-25); see the task 10 report.
+    // Table generated from IDA (2026-11-25); docs/QUEST_LOG_64.md lists every site.
     //
-    // Task 11 moves the watch array the same way: every operand 0xC23680 + k (m_questWatches, 12-byte entries; k from
+    // The watch array moves the same way: every operand 0xC23680 + k (m_questWatches, 12-byte entries; k from
     // -12) -> s_watches + k, and each `cmp r, 19h` bounding a watch index -> `cmp r, 40h` (64). The count 0xC23AE0
     // stays where it is. The watch functions are one group, patched all or nothing (PatchOperands), so the array
     // never lives in two places.
     //
-    // Task 12 moves the POI array the same way, as a second group: every operand 0xC23B00 + k (m_questPOIs, 0x30-byte
+    // The POI array moves the same way, as a second group: every operand 0xC23B00 + k (m_questPOIs, 0x30-byte
     // entries) -> s_pois + k, each 4-byte bound 4B0h (25 entries in bytes) -> C00h and each count 19h -> 40h (kPoiImm),
     // and each `cmp eax, 19h` POI index bound -> `cmp eax, 40h` (kPoiBound). GetQuestWorldMapAreaID's list walk is
     // in the group too, since the function holds POI operands. UpdatePOIIcons and GetPOIQuestIDByVisibleIndex are
     // ported and read whichever array is in use. The client's static constructor (0x9CB280) and atexit destructor
     // (0x9D64D0) of m_questPOIs keep working on the old, then unused, array.
     //
-    // Task 13: CheckForQuestItemLoot's descriptor walk bound 21Ch -> 528h (kSlotBytes; its slot read is a slot site).
+    // World checks: CheckForQuestItemLoot's descriptor walk bound 21Ch -> 528h (kSlotBytes; its slot read is a slot site).
     enum OperandKind : uint8_t { kRows, kCount, kBound, kWatches, kWatchBound, kPois, kPoiImm, kPoiBound, kSlotBytes };
     struct OperandPatch
     {
@@ -1583,7 +1611,7 @@ namespace
         {0x5E2950, 0x5E29CD, 0xC237B4, kRows},    //   then GetQuestLogEntry (0x5E0870, replaced)
         {0x5E2950, 0x5E29E5, 0xC237B0, kRows},
 
-        // ---- the watch group (Task 11) ----
+        // ---- the watch group ----
         {0x5DEA60, 0x5DEA74, 0xC23680, kWatches},      // RemoveQuestWatch (AscAttachLate detours its first 10 bytes)
         {0x5DEA60, 0x5DEA99, 0xC23680, kWatches},      //   lea eax, m_questWatches[eax*4]
         {0x5DEA60, 0x5DEABC, 0xC23674, kWatches},      //   mov m_questWatches[count-1].questId, 0
@@ -1626,14 +1654,14 @@ namespace
         {0x5E67C0, 0x5E6807, 0xC23AD0, kCount},        // Script_AddQuestWatch (then AddQuestWatch)
         {0x5E67C0, 0x5E6812, 0xC237B8, kRows},
         {0x5E67C0, 0x5E681B, 0xC237B0, kRows},
-        // (0x5E3840 GetPOIQuestIDByVisibleIndex, which also walks the watches, is ported: Task 12.)
+        // (0x5E3840 GetPOIQuestIDByVisibleIndex, which also walks the watches, is ported with the POIs.)
 
-        // ---- list-only, Task 12 ----
+        // ---- list-only, POI functions ----
         {0x5E6650, 0x5E671B, 0xC23AD0, kCount},        // Script_GetQuestPOILeaderBoard (then 0x5E58C0)
         {0x5E6650, 0x5E6726, 0xC237B8, kRows},
         {0x5E6650, 0x5E672E, 0xC237B0, kRows},
 
-        // ---- the POI group (Task 12) ----
+        // ---- the POI group ----
         {0x5DEEE0, 0x5DEEF2, 0xC23B00, kPois},         // GetQuestPOIIcon (also called by AscSuperTrack)
         {0x5DEEE0, 0x5DEEFF, 0x0004B0, kPoiImm},       //   cmp eax, 4B0h
         {0x5DEEE0, 0x5DEF14, 0xC23B2C, kPois},
@@ -1727,7 +1755,7 @@ namespace
     // which clobbers eax, ecx and edx as the original block does. The rest of each function (3 KB for
     // GetQuestLeaderBoardByID, with AscAttachLate's byte patches) runs unchanged.
     //
-    // Task 13: CheckForQuestItemLoot (0x6D7DE0) reads its entry in a 20-byte block,
+    // World checks: CheckForQuestItemLoot (0x6D7DE0) reads its entry in a 20-byte block,
     //     cmp eax, 19h / ja next / mov eax, [ebp-0Ch] (player) / mov esi, [eax+1008h] / add esi, edi
     // which becomes the same call (dest esi) and a jmp to the block's end, where the original tests esi for null.
     // Its `jl` before the block stays; its walk bound is a kSlotBytes operand patch.
@@ -1757,7 +1785,7 @@ namespace
           0x03, 0xF7}},
     };
 
-    // ---- Task 13: Packet_Group_17's slot walk -------------------------------------------------------------------
+    // ---- Packet_Group_17's slot walk --------------------------------------------------------------------------------
     //
     // Packet_Group_17 (0x6D8030, SMSG_QUESTUPDATE_*) looks the quest up in the 25 descriptor slots, in 60 bytes from
     // 0x6D807A (mov edi, [ebp-4]) to 0x6D80B6: edi = the quest id, ebx = 1 when its first slot is failed. That block
@@ -2029,6 +2057,7 @@ namespace
             {0x5E2EB0, reinterpret_cast<void*>(&UpdatePOIIcons)},
             {0x5E3840, reinterpret_cast<void*>(&GetPOIQuestIDByVisibleIndex)},
             {0x70F580, reinterpret_cast<void*>(&CanHighlight)},
+            {0x6DF370, reinterpret_cast<void*>(&OnUpdateQuest)},
         };
         for (const Replacement& r : replacements)
             AscRuntime::ReplaceFunction(r.address, r.fn);
