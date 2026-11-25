@@ -23,6 +23,8 @@ def function(source, signature):
 
 HARNESS = r'''
 #include <algorithm>
+#include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -322,6 +324,56 @@ int main()
     Check(WatchBound(0x32F883) == 0 && WatchBound(0x19C083) == 0, "WatchBound: refuses another immediate, not a cmp");
     Check(TimerLeft(100, 50, 140) == 9 && TimerLeft(0, 50, 51) == -2 && TimerLeft(10, 0x7FFFFFF0, 0) > 0,
           "TimerLeft: offset + time - now - 1");
+
+    // Task 12: m_questPOIs (0xC23B00, 25 x 0x30 bytes) moves to the DLL (64); UpdatePOIIcons' layout over 64.
+    Check(sizeof(Poi) == 0x30 && offsetof(Poi, blobCount) == 8 && offsetof(Poi, blobData) == 0x0C
+          && offsetof(Poi, iconX) == 0x20 && offsetof(Poi, visible) == 0x28 && offsetof(Poi, objectiveMask) == 0x2C,
+          "Poi: 0x30 bytes, as m_questPOIs");
+    Check(RelocatedPoi(0xC23B00, 0x10000000) == 0x10000000 && RelocatedPoi(0xC23B2C, 0x10000000) == 0x1000002C
+          && RelocatedPoi(0xC23B04, 0x10000000) == 0x10000004, "RelocatedPoi: base and fields");
+    Check(PoiImm(0x4B0) == 0xC00 && PoiImm(0x19) == 0x40 && PoiImm(0x18) == 0 && PoiImm(0x32) == 0,
+          "PoiImm: 25 x 0x30 -> 64 x 0x30, 25 -> 64, nothing else");
+
+    static Poi pois[64];
+    int32_t active[64];
+    uint8_t movable[64] = {};
+    // 30 POIs in slots 30..59 on one spot, all movable but slot 45: they spread, 45 stays put.
+    memset(pois, 0, sizeof(pois));
+    for (int32_t i = 0; i < 30; ++i)
+    {
+        active[i] = 30 + i;
+        pois[30 + i].iconX = 1000;
+        pois[30 + i].iconY = 1000;
+        movable[30 + i] = i != 15;
+    }
+    SpreadIcons(pois, active, 30, movable, 50.0f, 2500.0f, 2.5f, 20);
+    bool moved = true, inRange = true;
+    for (int32_t i = 30; i < 60; ++i)
+    {
+        if (i != 45)
+            moved &= pois[i].iconX != 1000 || pois[i].iconY != 1000;
+        inRange &= pois[i].iconX > 900 && pois[i].iconX < 1100 && pois[i].iconY > 900 && pois[i].iconY < 1100;
+    }
+    Check(moved && inRange && pois[45].iconX == 1000 && pois[45].iconY == 1000,
+          "SpreadIcons: 30 stacked icons in slots 30..59 spread, a fixed one stays");
+    // Two far apart: no force, nothing moves.
+    memset(pois, 0, sizeof(pois));
+    active[0] = 26;
+    active[1] = 63;
+    movable[26] = movable[63] = 1;
+    pois[26].iconX = 0;
+    pois[63].iconX = 5000;
+    SpreadIcons(pois, active, 2, movable, 50.0f, 2500.0f, 2.5f, 20);
+    Check(pois[26].iconX == 0 && pois[63].iconX == 5000 && pois[63].iconY == 0, "SpreadIcons: icons out of range stay");
+
+    // Completed quests: the second of two on one spot is shifted by (50, 86) * shift; a lone one stays.
+    memset(pois, 0, sizeof(pois));
+    int32_t complete[3] = {26, 40, 63};
+    pois[26].iconX = pois[40].iconX = 100;
+    pois[63].iconX = 9000;
+    ShiftComplete(pois, complete, 3, 0.5f);
+    Check(pois[26].iconX == 100 && pois[26].iconY == 0 && pois[40].iconX == 125 && pois[40].iconY == 43
+          && pois[63].iconX == 9000 && pois[63].iconY == 0, "ShiftComplete: stacked completed icons fan out past slot 25");
     return failures ? 1 : 0;
 }
 '''

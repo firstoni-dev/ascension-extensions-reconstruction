@@ -7,12 +7,15 @@
 // 25 ints, count 0xC23AD4) are too small for 64 quests and their zone headers; the list below holds 128 rows and 64
 // sort types (as CoA64 sizes them). Three techniques: functions with list logic or descriptor slot walks are ported;
 // functions that only index the list get their operands pointed at the DLL list (kOperandPatches); the four
-// leaderboard functions also get their one descriptor read replaced by a call (kSlotSites). The POI functions
-// (Task 12) and three DLL readers (Task 13) still read the old arrays, so after every write the first 50 rows and 25
-// sort types are copied back there with the counts clamped (Mirror); those readers miss only rows 50+. See Sync.
+// leaderboard functions also get their one descriptor read replaced by a call (kSlotSites). Three DLL readers (Task 13)
+// still read the old arrays, so after every write the first 50 rows and 25 sort types are copied back there with the
+// counts clamped (Mirror); those readers miss only rows 50+. See Sync.
 //
 // The watches (Task 11). CGQuestLog::m_questWatches (0xC23680, 25 x 12 bytes) moves to s_watches (64) by the same
 // operand patches, applied to the watch functions as one group; the timer Lua functions are ported.
+//
+// The POIs (Task 12). CGQuestLog::m_questPOIs (0xC23B00, 25 x 0x30 bytes) moves to s_pois (64) the same way, as a
+// second group; UpdatePOIIcons (stack arrays of 25) and GetPOIQuestIDByVisibleIndex are ported.
 //
 // The 25-bit collapse filter (cvar questLogCollapseFilter) is unchanged (spec non-goal): sort types past the 25th
 // have no collapse bit and always show expanded.
@@ -25,6 +28,7 @@
 #include <Ascension/AscQuestLog64.hpp>
 #include <Ascension/AscRuntime.hpp>
 #include <Ascension/AscScript.hpp>
+#include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -259,6 +263,142 @@ namespace AscQuestLog64List
         code[n] = static_cast<uint8_t>(done - (start + n + 1));
         return n + 1;
     }
+
+    // CGQuestLog::m_questPOIs entry (0xC23B00, 25 of them); the DLL keeps 64 (CoA64 m_questPOIs). `blob*` is the
+    // TSGrowableArray<QuestPOIBlob> (0x34-byte blobs; the client allocates them, ShutdownGame frees them).
+    struct Poi
+    {
+        int32_t questId;
+        uint32_t blobAlloc;
+        uint32_t blobCount;
+        uint32_t blobData;      // QuestPOIBlob* (32-bit client)
+        uint32_t blobChunk;
+        int32_t iconMapId;
+        int32_t iconObjective;
+        uint32_t iconFloor;
+        int32_t iconX;
+        int32_t iconY;
+        uint8_t visible;
+        uint8_t unused[3];
+        uint32_t objectiveMask;
+    };
+    static_assert(sizeof(Poi) == 0x30, "CGQuestLog::m_questPOIs entry");
+
+    // An operand that addressed the old POI array, pointed at the DLL's: 0xC23B00 + k -> `pois` + k.
+    uint32_t RelocatedPoi(uint32_t original, uint32_t pois) { return pois + (original - 0xC23B00); }
+    // A 4-byte POI bound: the byte offset 25 * 0x30 (`cmp r, 4B0h`) -> 64 * 0x30, the count 25 (`mov r, 19h`) -> 64.
+    uint32_t PoiImm(uint32_t original)
+    {
+        return original == 25 * sizeof(Poi) ? AscQuestLog64::kMaxSlots * sizeof(Poi)
+               : original == 25              ? AscQuestLog64::kMaxSlots
+                                             : 0;
+    }
+
+    // x*x + y*y with the client's 32-bit wrapping (imul / add).
+    int32_t DistanceSq(int32_t x, int32_t y)
+    {
+        return static_cast<int32_t>(static_cast<uint32_t>(x) * static_cast<uint32_t>(x) +
+                                    static_cast<uint32_t>(y) * static_cast<uint32_t>(y));
+    }
+
+    // UpdatePOIIcons (0x5E2EB0), the overlap pass: for `iterations` rounds, every pair of active icons closer than
+    // `radius` pushes the movable ones apart (an exact overlap gets one of three nudges), each round's forces scaled
+    // down to `maxStep`; stops early when nothing pushes. Indices are POI slots (0..63; the original's arrays held 25).
+    void SpreadIcons(Poi* pois, const int32_t* active, int32_t numActive, const uint8_t* movable, float radius,
+                     float radiusSq, float maxStep, int32_t iterations)
+    {
+        static const int32_t nudges[3][2] = {{0, 2}, {1, -2}, {-2, 1}};
+        uint32_t nudge = 0;
+        for (int32_t iteration = 0; iteration < iterations; ++iteration)
+        {
+            int32_t forces[AscQuestLog64::kMaxSlots][2] = {};
+            for (int32_t a = 0; a < numActive; ++a)
+            {
+                const int32_t indexA = active[a];
+                const int32_t ax = pois[indexA].iconX, ay = pois[indexA].iconY;
+                for (int32_t b = a + 1; b < numActive; ++b)
+                {
+                    const int32_t indexB = active[b];
+                    int32_t dx = ax - pois[indexB].iconX, dy = ay - pois[indexB].iconY;
+                    const int32_t distanceSq = DistanceSq(dx, dy);
+                    if (!(static_cast<double>(distanceSq) < radiusSq))
+                        continue;
+                    if (!distanceSq)
+                    {
+                        dx = nudges[nudge][0];
+                        dy = nudges[nudge][1];
+                        nudge = (nudge + 1) % 3;
+                    }
+                    const double scale = radius / sqrt(static_cast<double>(dx) * dx + static_cast<double>(dy) * dy);
+                    const int32_t fx = static_cast<int32_t>(dx * scale), fy = static_cast<int32_t>(scale * dy);
+                    if (movable[indexA])
+                    {
+                        forces[indexA][0] += fx;
+                        forces[indexA][1] += fy;
+                    }
+                    if (distanceSq && movable[indexB])
+                    {
+                        forces[indexB][0] -= fx;
+                        forces[indexB][1] -= fy;
+                    }
+                }
+            }
+            double maxForce = -9999999.0;
+            for (int32_t k = 0; k < numActive; ++k)
+                for (int32_t c = 0; c < 2; ++c)
+                    if (fabs(static_cast<double>(forces[active[k]][c])) > maxForce)
+                        maxForce = fabs(static_cast<double>(forces[active[k]][c]));
+            if (0.0 == maxForce)
+                break;
+            if (maxStep < maxForce)
+            {
+                const double scale = maxStep / maxForce;
+                for (int32_t k = 0; k < numActive; ++k)
+                    for (int32_t c = 0; c < 2; ++c)
+                        forces[active[k]][c] = static_cast<int32_t>(forces[active[k]][c] * scale);
+            }
+            for (int32_t k = 0; k < numActive; ++k)
+            {
+                pois[active[k]].iconX += forces[active[k]][0];
+                pois[active[k]].iconY += forces[active[k]][1];
+            }
+        }
+    }
+
+    // UpdatePOIIcons, completed quests (cvar POIShiftComplete = `shift` > 0.001): each icon that lies within
+    // shift * 100 (squared distance) of an earlier one chains to it, and every chained icon after the first is moved
+    // by the next of four offsets times `shift`.
+    void ShiftComplete(Poi* pois, const int32_t* complete, int32_t numComplete, float shift)
+    {
+        int32_t chain[AscQuestLog64::kMaxSlots] = {};
+        const double threshold = shift * 100.0;
+        for (int32_t c = 0; c < numComplete - 1; ++c)
+        {
+            const int32_t indexC = complete[c + 1];
+            const int32_t cx = pois[indexC].iconX, cy = pois[indexC].iconY;
+            for (int32_t d = c; d >= 0; --d)
+            {
+                const Poi& other = pois[complete[d]];
+                if (static_cast<double>(DistanceSq(cx - other.iconX, cy - other.iconY)) < threshold)
+                {
+                    chain[indexC] = chain[complete[d]] + 1;
+                    break;
+                }
+            }
+        }
+        static const int32_t offsets[4][2] = {{50, 86}, {-86, 50}, {-50, 86}, {-90, 10}};
+        uint32_t offset = 0;
+        for (int32_t k = 1; k < numComplete; ++k)
+        {
+            const int32_t index = complete[k];
+            if (!chain[index])
+                continue;
+            const int32_t ox = offsets[offset][0], oy = offsets[offset][1];
+            offset = (offset + 1) & 3;
+            pois[index].iconX += static_cast<int32_t>(ox * static_cast<double>(shift));
+            pois[index].iconY += static_cast<int32_t>(static_cast<double>(shift) * oy);
+        }
+    }
 }
 
 namespace
@@ -289,6 +429,12 @@ namespace
     {
         return s_watchesRelocated ? s_watches[i].questId : *reinterpret_cast<int32_t*>(0xC23680 + i * 12);
     }
+    // m_questPOIs (0xC23B00, 25 entries) moves to s_pois (64) once every POI function is patched (PatchOperands);
+    // until then the client array (25) stays in use, and the two ports below read it.
+    Poi s_pois[AscQuestLog64::kMaxSlots] = {};
+    bool s_poisRelocated = false;
+    Poi* Pois() { return s_poisRelocated ? s_pois : reinterpret_cast<Poi*>(0xC23B00); }
+    uint32_t NumPois() { return s_poisRelocated ? AscQuestLog64::kMaxSlots : AscQuestLog64::kNativeSlots; }
     uint8_t* CollapseCVar() { return *reinterpret_cast<uint8_t**>(0xBD0A34); }           // s_cvQuestLogCollapseFilter
     int32_t CollapseFilter() { return *reinterpret_cast<int32_t*>(CollapseCVar() + 0x30); }
 
@@ -361,10 +507,10 @@ namespace
     uint16_t EntryCount(const uint8_t* e, uint32_t i) { return *reinterpret_cast<const uint16_t*>(e + 8 + i * 2); }
     uint32_t EntryTime(const uint8_t* e) { return *reinterpret_cast<const uint32_t*>(e + 16); }
 
-    // The copy back into m_quests / m_sortTypes, for the readers not yet replaced: Task 12 (0x5E2B60, 0x5E2EB0,
-    // 0x5E3840, 0x5E6650), and the DLL's own readers of 0xC237B0 / 0xC23AD0 (Task 13): AscAttachFixes QuestRelevant,
-    // AscSmallApis ForOpenLoggedQuest and AscQuestSpellHide HiddenSpell. Also the watch functions (Task 11), but only
-    // when their bytes did not match and they were left unpatched. Remove once all of them are replaced.
+    // The copy back into m_quests / m_sortTypes. No client function reads it once every patch applies; it is left
+    // for the DLL's own readers of 0xC237B0 / 0xC23AD0 (Task 13): AscAttachFixes QuestRelevant, AscSmallApis
+    // ForOpenLoggedQuest and AscQuestSpellHide HiddenSpell, and for a function whose bytes did not match and stayed
+    // unpatched (a list function, the watch group or the POI group). Task 13 removes it.
     void Sync() { Mirror(s_list, NativeRows(), NativeCount(), NativeSortTypes(), NativeNumSortTypes()); }
 
     const Row* QuestRow(int32_t index)
@@ -1016,6 +1162,188 @@ namespace
         return 1;
     }
 
+    // ---- POIs (Task 12) ----------------------------------------------------------------------------------------
+
+    // An inline WowClientDB::GetRecord as UpdatePOIIcons does it: the table's min id at `minAt`, the max id 4 bytes
+    // before it, the row pointers 0x10 after it.
+    const uint8_t* InlineRecord(uint32_t minAt, int32_t id)
+    {
+        const int32_t min = *reinterpret_cast<const int32_t*>(minAt), max = *reinterpret_cast<const int32_t*>(minAt - 4);
+        return id < min || id > max ? nullptr : (*reinterpret_cast<const uint8_t* const* const*>(minAt + 0x10))[id - min];
+    }
+
+    // 0x5E2EB0 CGQuestLog::UpdatePOIIcons: picks each POI's best blob on the current (dungeon) map, then spreads the
+    // icons of active quests and fans out those of completed ones. Ported because its local arrays (chain,
+    // completeList, movable, activeList, forces) hold 25 and live in its stack frame; CoA64 sizes them 64.
+    void __cdecl UpdatePOIIcons()
+    {
+        const uint8_t* poiCVar = *reinterpret_cast<const uint8_t* const*>(0xBD0A3C);   // g_questPOICVar
+        if (!Q<int32_t>(poiCVar, 0x30))
+            return;
+        uint8_t* player = Player();
+        if (!player)
+            return;
+
+        typedef int32_t(__cdecl* AreaId_t)();   // CGWorldMap::GetCurrentAreaID 0x543770
+        const AreaId_t currentArea = reinterpret_cast<AreaId_t>(0x543770);
+        const int32_t orphanZone = *reinterpret_cast<const int32_t*>(0xACCF10);   // CGWorldMap::m_currentOrphanZone
+        const uint8_t* dungeon = InlineRecord(0xAD36E4,   // g_dungeonMapDB, m_currentDungeonMap
+                                              orphanZone != -1 ? *reinterpret_cast<const int32_t*>(0xACCF0C) : -1);
+        const uint8_t* area = nullptr;
+        if (!dungeon)
+        {
+            area = InlineRecord(0xAD4ECC, currentArea());   // g_worldMapAreaDB
+            if (currentArea() == -1 || !area)
+                return;
+        }
+
+        float position[3];   // CGObject_C::GetPosition, vtable +0x2C (thiscall, out C3Vector)
+        typedef void(__thiscall* Position_t)(void*, float*);
+        (*reinterpret_cast<Position_t*>(*reinterpret_cast<uint8_t**>(player) + 0x2C))(player, position);
+        typedef uint8_t(__cdecl* OnDungeon_t)(const void*, int32_t, int32_t, int32_t);   // 0x5E0180, al
+        typedef uint8_t(__cdecl* OnMap_t)(const void*, int32_t, int32_t);                // 0x5E0110, al
+        const OnDungeon_t onDungeonMap = reinterpret_cast<OnDungeon_t>(0x5E0180);   // IsPOIVisibleOnDungeonMap
+        const OnMap_t onCurrentMap = reinterpret_cast<OnMap_t>(0x5E0110);           // IsPOIOnCurrentMap
+
+        Poi* pois = Pois();
+        const uint32_t numPois = NumPois();
+        int32_t numActive = 0, numComplete = 0;
+        int32_t completeList[kMaxSlots], activeList[kMaxSlots];
+        uint8_t movable[kMaxSlots] = {};
+        for (uint32_t i = 0; i < numPois; ++i)
+        {
+            Poi& poi = pois[i];
+            const uint8_t* blobs = reinterpret_cast<const uint8_t*>(poi.blobData);
+            float bestDistance = 3.4028235e38f;
+            int32_t best = -1, bestPriority = 10;
+            for (int32_t j = 0; j < static_cast<int32_t>(poi.blobCount); ++j)
+            {
+                // QuestPOIBlob: +0x10 center x/y, +0x1C objective, +0x20 map, +0x24 world map area, +0x28 floor,
+                // +0x2C flags, +0x30 priority.
+                const uint8_t* blob = blobs + j * 0x34;
+                const int32_t objective = Q<int32_t>(blob, 0x1C);
+                const uint32_t mask = poi.objectiveMask;
+                if (!((objective == -1 && mask == 0xFFFFFFFF) || (mask != 0xFFFFFFFF && ((1u << (objective & 31)) & mask))))
+                    continue;   // the client's shl takes the count mod 32
+                uint8_t visible;
+                if (dungeon)
+                    visible = onDungeonMap(blob + 0x10, Q<int32_t>(blob, 0x20), Q<int32_t>(blob, 0x28), Q<int32_t>(dungeon, 0));
+                else
+                {
+                    if (!area || ((Q<uint8_t>(blob, 0x2C) & 4) && Q<int32_t>(blob, 0x24) != Q<int32_t>(area, 0)))
+                        continue;
+                    visible = onCurrentMap(blob + 0x10, Q<int32_t>(blob, 0x20), Q<int32_t>(area, 4));
+                }
+                if (!visible)
+                    continue;
+                const int32_t priority = Q<int32_t>(blob, 0x30);
+                const double dy = fabs(static_cast<double>(position[1]) - Q<int32_t>(blob, 0x14));
+                const double dx = fabs(static_cast<double>(position[0]) - Q<int32_t>(blob, 0x10));
+                const double distance = dx * dx + dy * dy;
+                if (priority < bestPriority || (bestDistance > distance && priority == bestPriority))
+                {
+                    bestDistance = static_cast<float>(distance);
+                    best = j;
+                    bestPriority = priority;
+                }
+            }
+            if (best == -1)
+            {
+                poi.iconMapId = 0;
+                poi.iconObjective = 0;
+                poi.iconFloor = 0;
+                poi.iconX = 999999;
+                poi.iconY = 999999;
+                continue;
+            }
+            const uint8_t* blob = blobs + best * 0x34;
+            poi.iconMapId = Q<int32_t>(blob, 0x20);
+            poi.iconObjective = Q<int32_t>(blob, 0x1C);
+            poi.iconFloor = Q<uint32_t>(blob, 0x28);
+            poi.iconX = Q<int32_t>(blob, 0x10);
+            poi.iconY = Q<int32_t>(blob, 0x14);
+            // The original's inline GetQuestIndex walks 50 rows; the list has 128 (CoA64).
+            if (IsQuestCompleteEx(QuestIndex(s_list, poi.questId) - 1, 1))
+                completeList[numComplete++] = static_cast<int32_t>(i);
+            else
+            {
+                movable[i] = Q<int32_t>(blob, 4) != 1;   // the blob's point count
+                activeList[numActive++] = static_cast<int32_t>(i);
+            }
+        }
+        if (!area)
+            return;
+
+        int32_t zoneId;
+        const int32_t continent = *reinterpret_cast<const int32_t*>(0xACCF04);   // CGWorldMap::m_currentContinent
+        if (continent < 0)
+            zoneId = *reinterpret_cast<const int32_t*>(0xACCF10);
+        else
+        {
+            // CGWorldMap::m_continents.m_data (0x10028-byte entries): +4 area id, +0x10 zones; m_currentZone 0xACCF08.
+            const uint8_t* info = *reinterpret_cast<const uint8_t* const*>(0xBE8F10) + continent * 0x10028;
+            const int32_t zone = *reinterpret_cast<const int32_t*>(0xACCF08);
+            zoneId = zone < 0 ? Q<int32_t>(info, 4) : Q<const int32_t*>(info, 0x10)[zone];
+        }
+        if (zoneId == -1)
+            return;
+
+        const float overlap = *reinterpret_cast<const float*>(0xAD1014);   // m_questIconOverlapDist
+        const int32_t span = static_cast<int32_t>(fabs(static_cast<double>(Q<float>(area, 0x10)) - Q<float>(area, 0x14)));
+        const double r = span * (static_cast<double>(overlap) + overlap) * 0.0009765625;
+        for (int32_t k = 0; k < numActive; ++k)
+            pois[activeList[k]].iconY = static_cast<int32_t>(pois[activeList[k]].iconY * static_cast<double>(0.75001878f));
+        SpreadIcons(pois, activeList, numActive, movable, static_cast<float>(r), static_cast<float>(r * r),
+                    static_cast<float>(0.05f * r), *reinterpret_cast<const int32_t*>(0xAD1264));   // s_poiOverlapIterations
+        const uint8_t* shift = *reinterpret_cast<const uint8_t* const*>(0xC23AFC);   // s_cvPOIShiftComplete
+        if (shift && Q<float>(shift, 0x2C) > 0.001f)
+            ShiftComplete(pois, completeList, numComplete, Q<float>(shift, 0x2C));
+        for (int32_t k = 0; k < numActive; ++k)
+            pois[activeList[k]].iconY = static_cast<int32_t>(pois[activeList[k]].iconY * static_cast<double>(1.3333f));
+    }
+
+    // 0x5E3840 CGQuestLog::GetPOIQuestIDByVisibleIndex: the quest of the index-th visible POI, counting completed
+    // (or objective-less) quests first, then watched quests in watch order, then the rest; -1 when none. Ported, not
+    // patched: its watch walks would tie a POI byte mismatch to the watch group.
+    int __cdecl GetPOIQuestIDByVisibleIndex(int32_t index)
+    {
+        const Poi* pois = Pois();
+        const uint32_t numPois = NumPois();
+        if (static_cast<uint32_t>(index) >= numPois)
+            return -1;
+        typedef int(__cdecl* PoiIndex_t)(int32_t);   // CGQuestLog::GetQuestPOIIndex 0x5E2900 (POI group)
+        const PoiIndex_t poiIndex = reinterpret_cast<PoiIndex_t>(0x5E2900);
+        const auto finished = [](int32_t questId) {
+            return IsQuestCompleteEx(static_cast<uint32_t>(GetQuestIndex(questId) - 1), 1) ||
+                   HasNoObjectives(static_cast<uint32_t>(GetQuestIndex(questId) - 1));
+        };
+
+        int32_t visible = 0;
+        for (uint32_t i = 0; i < numPois; ++i)
+            if (pois[i].visible && finished(pois[i].questId) && index == visible++)
+                return pois[i].questId;
+        for (int32_t i = 0; i < static_cast<int32_t>(NumWatches()); ++i)
+        {
+            const int32_t questId = WatchQuest(static_cast<uint32_t>(i));
+            if (finished(questId))
+                continue;
+            const int32_t poi = poiIndex(questId);
+            if (poi >= 0 && pois[poi].visible && index == visible++)
+                return pois[poi].questId;
+        }
+        for (uint32_t i = 0; i < numPois; ++i)
+        {
+            if (!pois[i].visible || finished(pois[i].questId))
+                continue;
+            uint32_t watch = 0;
+            while (watch < NumWatches() && WatchQuest(watch) != pois[i].questId)
+                ++watch;
+            if (watch >= NumWatches() && index == visible++)
+                return pois[i].questId;
+        }
+        return -1;
+    }
+
     // ---- operand patches: client functions that only index the list ------------------------------------------
     //
     // Instead of a port, every operand that addresses the old list is pointed at the DLL list: m_quests row
@@ -1030,11 +1358,18 @@ namespace
     // -12) -> s_watches + k, and each `cmp r, 19h` bounding a watch index -> `cmp r, 40h` (64). The count 0xC23AE0
     // stays where it is. The watch functions are one group, patched all or nothing (PatchOperands), so the array
     // never lives in two places.
-    enum OperandKind : uint8_t { kRows, kCount, kBound, kWatches, kWatchBound };
+    //
+    // Task 12 moves the POI array the same way, as a second group: every operand 0xC23B00 + k (m_questPOIs, 0x30-byte
+    // entries) -> s_pois + k, each 4-byte bound 4B0h (25 entries in bytes) -> C00h and each count 19h -> 40h (kPoiImm),
+    // and each `cmp eax, 19h` POI index bound -> `cmp eax, 40h` (kPoiBound). GetQuestWorldMapAreaID's list walk is
+    // in the group too, since the function holds POI operands. UpdatePOIIcons and GetPOIQuestIDByVisibleIndex are
+    // ported and read whichever array is in use. The client's static constructor (0x9CB280) and atexit destructor
+    // (0x9D64D0) of m_questPOIs keep working on the old, then unused, array.
+    enum OperandKind : uint8_t { kRows, kCount, kBound, kWatches, kWatchBound, kPois, kPoiImm, kPoiBound };
     struct OperandPatch
     {
         uint32_t function;
-        uint32_t at;         // the operand's 4 bytes (kRows, kCount, kWatches); the instruction (kBound, kWatchBound)
+        uint32_t at;         // the operand's 4 bytes (kRows, kCount, kWatches, kPois, kPoiImm); the instruction (bounds)
         uint32_t original;   // the operand's value; for a bound, the instruction's 3 bytes little-endian
         OperandKind kind;
     };
@@ -1143,12 +1478,89 @@ namespace
         {0x5E67C0, 0x5E6807, 0xC23AD0, kCount},        // Script_AddQuestWatch (then AddQuestWatch)
         {0x5E67C0, 0x5E6812, 0xC237B8, kRows},
         {0x5E67C0, 0x5E681B, 0xC237B0, kRows},
-        // GetPOIQuestIDByVisibleIndex walks the watches too; its list reads and POI bounds are Task 12's.
-        {0x5E3840, 0x5E38D5, 0xC23680, kWatches},
-        {0x5E3840, 0x5E3A22, 0xC23680, kWatches},
+        // (0x5E3840 GetPOIQuestIDByVisibleIndex, which also walks the watches, is ported: Task 12.)
+
+        // ---- list-only, Task 12 ----
+        {0x5E6650, 0x5E671B, 0xC23AD0, kCount},        // Script_GetQuestPOILeaderBoard (then 0x5E58C0)
+        {0x5E6650, 0x5E6726, 0xC237B8, kRows},
+        {0x5E6650, 0x5E672E, 0xC237B0, kRows},
+
+        // ---- the POI group (Task 12) ----
+        {0x5DEEE0, 0x5DEEF2, 0xC23B00, kPois},         // GetQuestPOIIcon (also called by AscSuperTrack)
+        {0x5DEEE0, 0x5DEEFF, 0x0004B0, kPoiImm},       //   cmp eax, 4B0h
+        {0x5DEEE0, 0x5DEF14, 0xC23B2C, kPois},
+        {0x5DEEE0, 0x5DEF20, 0xC23B14, kPois},
+        {0x5DEEE0, 0x5DEF2B, 0xC23B1C, kPois},
+        {0x5DEEE0, 0x5DEF36, 0xC23B20, kPois},
+        {0x5DEEE0, 0x5DEF41, 0xC23B24, kPois},
+        {0x5DEEE0, 0x5DEF4C, 0xC23B18, kPois},
+        {0x5DFA80, 0x5DFAC1, 0x19F883, kPoiBound},     // Script_QuestPOIGetQuestIDByIndex: index < 25 (jnb)
+        {0x5DFA80, 0x5DFACE, 0xC23B00, kPois},
+        {0x5E28B0, 0x5E28E2, 0xC23B00, kPois},         // HasQuestPOI
+        {0x5E28B0, 0x5E28EC, 0x0004B0, kPoiImm},
+        {0x5E2900, 0x5E2932, 0xC23B00, kPois},         // GetQuestPOIIndex
+        {0x5E2900, 0x5E2940, 0x0004B0, kPoiImm},
+        {0x5E2B60, 0x5E2C1A, 0xC23B00, kPois},         // GetQuestWorldMapAreaID: the POI search
+        {0x5E2B60, 0x5E2C27, 0x0004B0, kPoiImm},
+        {0x5E2B60, 0x5E2C3A, 0xC23B00, kPois},
+        {0x5E2B60, 0x5E2C52, 0xC23B08, kPois},
+        {0x5E2B60, 0x5E2C58, 0xC23B2C, kPois},
+        {0x5E2B60, 0x5E2C82, 0xC23B2C, kPois},
+        {0x5E2B60, 0x5E2C8D, 0xC23B0C, kPois},
+        {0x5E2B60, 0x5E2CA1, 0xC23B0C, kPois},
+        {0x5E2B60, 0x5E2D25, 0xC23B0C, kPois},
+        {0x5E2B60, 0x5E2D9C, 0xC23B08, kPois},
+        {0x5E2B60, 0x5E2DC9, 0xC23B0C, kPois},
+        {0x5E2B60, 0x5E2DDB, 0xC23B0C, kPois},
+        {0x5E2B60, 0x5E2DF2, 0xC237B0, kRows},         //   and its header walk over the list: mov ecx, offset m_quests
+        {0x5E2B60, 0x5E2E09, 0x32F883, kBound},        //   cmp eax, 32h (eax from 0 by 1, jb)
+        {0x5E2B60, 0x5E2E1C, 0xC237B0, kRows},         //   mov ecx, m_quests[header]
+        {0x5E3AC0, 0x5E3AD3, 0x19F883, kPoiBound},     // GetQuestPOIInfo: index < 25 (jnb)
+        {0x5E3AC0, 0x5E3ADF, 0xC23B00, kPois},
+        {0x5E3B90, 0x5E3C39, 0xC23B00, kPois},         // GetQuestPOIDistance (index from GetQuestPOIIndex)
+        {0x5E3B90, 0x5E3C48, 0xC23B08, kPois},
+        {0x5E3B90, 0x5E3C4E, 0xC23B2C, kPois},
+        {0x5E3B90, 0x5E3C62, 0xC23B2C, kPois},
+        {0x5E3B90, 0x5E3C6D, 0xC23B0C, kPois},
+        {0x5E3B90, 0x5E3C81, 0xC23B0C, kPois},
+        {0x5E3B90, 0x5E3CE1, 0xC23B0C, kPois},
+        {0x5E3B90, 0x5E3D3A, 0xC23B08, kPois},
+        {0x5E5A50, 0x5E5B16, 0xC23B00, kPois},         // UpdateAllQuestPOI
+        {0x5E5A50, 0x5E5B25, 0xC23B08, kPois},
+        {0x5E5A50, 0x5E5B2B, 0xC23B2C, kPois},
+        {0x5E5A50, 0x5E5B31, 0xC23B28, kPois},
+        {0x5E5A50, 0x5E5B42, 0xC23B2C, kPois},
+        {0x5E5A50, 0x5E5B4D, 0xC23B0C, kPois},
+        {0x5E5A50, 0x5E5B60, 0xC23B0C, kPois},
+        {0x5E5A50, 0x5E5BD1, 0xC23B08, kPois},
+        {0x5E5A50, 0x5E5BE6, 0xC23B28, kPois},
+        {0x5E5A50, 0x5E5BF0, 0x0004B0, kPoiImm},
+        {0x5E6F30, 0x5E6F41, 0xC23B0C, kPois},         // ShutdownGame: frees the blobs
+        {0x5E6F30, 0x5E6F46, 0x000019, kPoiImm},       //   mov ebx, 19h (count down)
+        {0x5E7020, 0x5E7062, 0xC23B00, kPois},         // FindOrFreePOISlot
+        {0x5E7020, 0x5E707F, 0x0004B0, kPoiImm},
+        {0x5E7020, 0x5E7097, 0xC23B04, kPois},
+        {0x5E7020, 0x5E70A1, 0xC23B00, kPois},
+        {0x5E70D0, 0x5E70DA, 0xC23B0C, kPois},         // UpdateQuestPOIFromUserServer
+        {0x5E70D0, 0x5E70E1, 0x000019, kPoiImm},       //   mov [ebp-0Ch], 19h (count down)
+        {0x5E71A0, 0x5E7202, 0xC23B00, kPois},         // InitializeGame (detoured at its first 5 bytes): POI fields
+        {0x5E71A0, 0x5E7208, 0xC23B14, kPois},
+        {0x5E71A0, 0x5E720E, 0xC23B18, kPois},
+        {0x5E71A0, 0x5E7214, 0xC23B1C, kPois},
+        {0x5E71A0, 0x5E721A, 0xC23B20, kPois},
+        {0x5E71A0, 0x5E7220, 0xC23B24, kPois},
+        {0x5E71A0, 0x5E7226, 0xC23B29, kPois},
+        {0x5E71A0, 0x5E722C, 0xC23B28, kPois},
+        {0x5E71A0, 0x5E7232, 0xC23B2C, kPois},
+        {0x5E71A0, 0x5E723A, 0x0004B0, kPoiImm},
+        {0x5E7370, 0x5E73E2, 0xC23B00, kPois},         // HandlePOIQueryResponse: known?
+        {0x5E7370, 0x5E73F0, 0x0004B0, kPoiImm},
+        {0x5E7370, 0x5E7412, 0x19F883, kPoiBound},     //   slot from FindOrFreePOISlot < 25 (jnb)
+        {0x5E7370, 0x5E7425, 0xC23B00, kPois},
     };
 
     bool IsWatchPatch(const OperandPatch& p) { return p.kind == kWatches || p.kind == kWatchBound; }
+    bool IsPoiPatch(const OperandPatch& p) { return p.kind == kPois || p.kind == kPoiImm || p.kind == kPoiBound; }
 
     // The quest log entry the four leaderboard functions below read, for any slot (they keep their slot < 0 test).
     const uint8_t* __cdecl SiteSlotEntry(const uint8_t* player, uint32_t slot)
@@ -1197,13 +1609,16 @@ namespace
         FlushInstructionCache(GetCurrentProcess(), reinterpret_cast<void*>(at), size);
     }
 
-    bool IsBound(const OperandPatch& p) { return p.kind == kBound || p.kind == kWatchBound; }
+    bool IsBound(const OperandPatch& p) { return p.kind == kBound || p.kind == kWatchBound || p.kind == kPoiBound; }
+    // A POI index bound `cmp r32, 19h` takes the same 25 -> 64 rewrite as a watch bound.
     uint32_t BoundPatched(const OperandPatch& p) { return p.kind == kBound ? RowBound(p.original) : WatchBound(p.original); }
 
     bool OperandMatches(const OperandPatch& p)
     {
         if (IsBound(p))
             return BoundPatched(p) != 0 && memcmp(reinterpret_cast<const void*>(p.at), &p.original, 3) == 0;
+        if (p.kind == kPoiImm && !PoiImm(p.original))
+            return false;
         return memcmp(reinterpret_cast<const void*>(p.at), &p.original, 4) == 0;
     }
 
@@ -1214,10 +1629,16 @@ namespace
             const uint32_t bytes = BoundPatched(p);
             return WriteCode(p.at, &bytes, 3);
         }
-        const uint32_t value = p.kind == kWatches
-                                   ? RelocatedWatch(p.original, reinterpret_cast<uint32_t>(s_watches))
-                                   : Relocated(p.original, reinterpret_cast<uint32_t>(s_list.rows),
-                                               reinterpret_cast<uint32_t>(&s_list.count));
+        uint32_t value;
+        switch (p.kind)
+        {
+        case kWatches: value = RelocatedWatch(p.original, reinterpret_cast<uint32_t>(s_watches)); break;
+        case kPois: value = RelocatedPoi(p.original, reinterpret_cast<uint32_t>(s_pois)); break;
+        case kPoiImm: value = PoiImm(p.original); break;
+        default:
+            value = Relocated(p.original, reinterpret_cast<uint32_t>(s_list.rows), reinterpret_cast<uint32_t>(&s_list.count));
+            break;
+        }
         WriteCode(p.at, &value, 4);
     }
 
@@ -1259,16 +1680,19 @@ namespace
                 ApplySlotSite(s);
     }
 
-    bool InWatchGroup(uint32_t function)
+    enum Group : uint8_t { kOwn, kWatchGroup, kPoiGroup };   // kOwn: each function on its own
+    Group GroupOf(uint32_t function)
     {
         for (const OperandPatch& p : kOperandPatches)
-            if (p.function == function && IsWatchPatch(p))
-                return true;
-        return false;
+            if (p.function == function && (IsWatchPatch(p) || IsPoiPatch(p)))
+                return IsWatchPatch(p) ? kWatchGroup : kPoiGroup;
+        return kOwn;
     }
+    bool InWatchGroup(uint32_t function) { return GroupOf(function) == kWatchGroup; }
 
-    // The distinct functions of the table, in table order; `watchGroup` selects the watch group or the others.
-    uint32_t Functions(uint32_t* out, uint32_t max, bool watchGroup)
+    // The distinct functions of `group`, in table order (the table has 23 on their own, 9 watch and 13 POI
+    // functions); `max` is checked so a longer table fails loudly instead of skipping functions.
+    uint32_t Functions(uint32_t* out, uint32_t max, Group group)
     {
         uint32_t count = 0;
         for (const OperandPatch& p : kOperandPatches)
@@ -1276,40 +1700,62 @@ namespace
             bool seen = false;
             for (uint32_t i = 0; i < count; ++i)
                 seen |= out[i] == p.function;
-            if (!seen && count < max && InWatchGroup(p.function) == watchGroup)
-                out[count++] = p.function;
+            if (seen || GroupOf(p.function) != group)
+                continue;
+            if (count == max)
+            {
+                AscLog::Printf("AscQuestLog64List: more than %u functions in a patch group", max);
+                return 0;
+            }
+            out[count++] = p.function;
         }
         return count;
     }
 
+    // Applies a group all or nothing; false (nothing written) on any mismatch.
+    bool PatchGroup(Group group, const char* what)
+    {
+        uint32_t functions[64];
+        const uint32_t count = Functions(functions, 64, group);
+        bool ok = count != 0;
+        for (uint32_t i = 0; i < count; ++i)
+            ok &= FunctionMatches(functions[i]);
+        if (!ok)
+        {
+            AscLog::Printf("AscQuestLog64List: the %s functions left unpatched (25 entries)", what);
+            return false;
+        }
+        for (uint32_t i = 0; i < count; ++i)
+            ApplyFunction(functions[i]);
+        return true;
+    }
+
     // Each list function on its own, all or nothing; the watch functions as one group, all or nothing, after which
-    // m_questWatches lives in s_watches (64). A mismatch anywhere in the group leaves every watch function on the
-    // client array (25 watches, list rows through the mirror).
+    // m_questWatches lives in s_watches (64); the POI functions likewise, after which m_questPOIs lives in s_pois
+    // (64). A mismatch anywhere in a group leaves that whole group on the client array (25 entries, list rows
+    // through the mirror).
     void PatchOperands()
     {
         uint32_t functions[64];
-        const uint32_t count = Functions(functions, 64, false);
+        const uint32_t count = Functions(functions, 64, kOwn);
         for (uint32_t i = 0; i < count; ++i)
             if (FunctionMatches(functions[i]))
                 ApplyFunction(functions[i]);
             else
                 AscLog::Printf("AscQuestLog64List: 0x%06X left unpatched", functions[i]);
 
-        const uint32_t watchCount = Functions(functions, 64, true);
-        bool ok = true;
-        for (uint32_t i = 0; i < watchCount; ++i)
-            ok &= FunctionMatches(functions[i]);
-        if (!ok)
-        {
-            AscLog::Printf("AscQuestLog64List: the quest watch functions left unpatched (25 watches)");
-            return;
-        }
-        // Carry over what the client array holds (empty at load; the module initialises before the world).
+        // Carry over what the client watch array holds (empty at load; the module initialises before the world).
         const uint32_t live = NumWatches() < AscQuestLog64::kNativeSlots ? NumWatches() : AscQuestLog64::kNativeSlots;
-        memcpy(s_watches, reinterpret_cast<const void*>(0xC23680), live * sizeof(Watch));
-        for (uint32_t i = 0; i < watchCount; ++i)
-            ApplyFunction(functions[i]);
-        s_watchesRelocated = true;
+        Watch carried[AscQuestLog64::kNativeSlots];
+        memcpy(carried, reinterpret_cast<const void*>(0xC23680), live * sizeof(Watch));
+        if (PatchGroup(kWatchGroup, "quest watch"))
+        {
+            memcpy(s_watches, carried, live * sizeof(Watch));
+            s_watchesRelocated = true;
+        }
+        // The POI array is not carried over: it is empty before the world, and its blobs are heap arrays that the
+        // client's destructor would free a second time.
+        s_poisRelocated = PatchGroup(kPoiGroup, "quest POI");
     }
 
     // ---- MAX_QUESTLOG_QUESTS / MAX_WATCHABLE_QUESTS ------------------------------------------------------------
@@ -1368,6 +1814,8 @@ namespace
             {0x5E0870, reinterpret_cast<void*>(&GetQuestLogEntry)},   // also serves 0x5E58C0, 0x5E2950
             {0x5E6240, reinterpret_cast<void*>(&Script_GetQuestTimers)},
             {0x5E4FB0, reinterpret_cast<void*>(&Script_GetQuestIndexForTimer)},
+            {0x5E2EB0, reinterpret_cast<void*>(&UpdatePOIIcons)},
+            {0x5E3840, reinterpret_cast<void*>(&GetPOIQuestIDByVisibleIndex)},
         };
         for (const Replacement& r : replacements)
             AscRuntime::ReplaceFunction(r.address, r.fn);
