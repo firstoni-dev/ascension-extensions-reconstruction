@@ -54,6 +54,11 @@ option(ASCENSION_HOT_PATCH "Interface hot-patch channel and the 0x5BC formatter 
 # original has no patch handler for. OFF by default. See src/Ascension/AscDbcStream.cpp.
 option(ASCENSION_DBC_STREAM "Server-streamed GameObjectDisplayInfo / Map / MapDifficulty rows (not in the original)" OFF)
 
+# --- Quest log of 64 quests (our addition; not in the original) ---------------------------------------
+# SMSG 0x8F7 carries quest log slots 25..63; the DLL announces itself with CMSG 0x8F6 after every world entry.
+# ON by default; OFF gives the genuine 25-slot behaviour. See src/Ascension/AscQuestLog64.cpp.
+option(ASCENSION_QUEST_LOG_64 "Quest log of 64 quests via SMSG 0x8F7 (not in the original)" ON)
+
 set(UP ${CMAKE_CURRENT_SOURCE_DIR}/WotLKExtensions)
 configure_file(${UP}/cmake/PatchConfig.hpp.in ${CMAKE_BINARY_DIR}/gen/PatchConfig.hpp)
 

@@ -47,6 +47,11 @@ packets and fires events.
   a supported channel for server-sent interface Lua (SMSG `0x8F0`, with the capability and result packets
   CMSG `0x8F1` / `0x8F2`), and a check that refuses SMSG `0x5BC` challenge requirement-type rows whose formatters
   carry anything but a display expression. See `src/Ascension/AscHotPatch.cpp`.
+- **Quest log of 64 quests.** Not in the genuine DLL, and **on by default** (unlike the other additions). The server
+  sends quest log slots 25..63 in SMSG `0x8F7`, and the DLL announces CMSG `0x8F6` (u8 version 1, u8 64) after every
+  world entry; a server that never answers keeps the native 25 slots. `AscQuestLog64::SlotEntry` is the client's
+  quest log entry for any of the 64 slots. See `src/Ascension/AscQuestLog64.cpp`; `tests/quest_log_64.py` checks the
+  store. Build with `-DASCENSION_QUEST_LOG_64=OFF` for the genuine 25-slot behaviour.
 
 The portable regression in `tests/native_ca_packets.py` compiles the production native packet handlers
 against client API doubles. It covers initial state, listener timing, subsequent updates, new preset slots
@@ -78,6 +83,11 @@ cmake --build build
 
 The output is `build\Extensions.dll`. Place it next to `Ascension.exe`, which loads it itself (there is no
 injector).
+
+### Optional: without the 64-quest log
+
+The quest log of 64 quests is compiled in by default. `-DASCENSION_QUEST_LOG_64=OFF` leaves it out and gives the
+genuine 25-slot behaviour.
 
 ### Optional: interface hot-patch build
 
