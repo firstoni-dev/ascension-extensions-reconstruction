@@ -198,29 +198,29 @@ Mark each line PASS or FAIL, with a note.
 
 | # | Check | Result |
 |---|---|---|
-| 1 | The quest log lists all 40 quests with zone headers, and the counter reads "Quests: 40/64" | |
-| 2 | Quests 26–40 can be tracked in the watch frame; more than 25 tracked at once; the tracked set survives `/reload` | |
-| 3 | Quests 26–40 show POIs on the world map and minimap. The watch-frame POI buttons and the SuperTrack arrow work for them | |
-| 4 | Quests 26–40 show the scaled level colour and reward XP in the log | |
-| 5 | Killing a mob for an overflow quest (e.g. quest 30) updates the tracker and the log's objective lines | |
-| 6 | A quest item for an overflow quest (e.g. quest 35) drops as quest loot and shows the "x/y" message. Its quest objects sparkle | |
-| 7 | Abandoning an overflow quest (e.g. quest 38) removes it from the log and from the server | |
-| 8 | An overflow quest (e.g. quest 33) can be shared with a party member | |
-| 9 | Turning in a quest in slots 1–25 moves an overflow quest up; it is shown once, with no duplicate | |
-| 10 | After `/reload`, all quests are still listed | |
-| 11 | Logging out to another character shows that character's own log, with no leftovers | |
-| 12 | The Extra Quests window never appears | |
-| 13 | After setting `Quests.LogSize = 30` and running `reload config` while logged in, the counter reads n/30 without a relog | |
-| 14 | Against the old server build (`var\build\coa`), the client behaves as a 25-quest client: 25 in the log, the rest in the Extra Quests window | |
-| 15 | Accepting a 26th quest shows "Quest accepted" once and fires `QUEST_ACCEPTED` once, with a single `QUEST_LOG_UPDATE` per packet | |
-| 16 | No "Quest accepted" message appears at login or after `/reload` | |
-| 17 | A quest in slot 25+ that fails (an escort, or a timed quest that runs out) shows as failed in the log, with the "quest failed" error | |
-| 18 | A timed quest in slot 25+ shows in the quest timer frame and counts down | |
-| 19 | Abandoning or turning in a quest in slot 25+ fires `QUEST_REMOVED` for it and clears its map point | |
-| 20 | An auto-complete quest in slot 25+ completes on its own once its objectives are done | |
-| 21 | The tooltip of a mob or object for a quest in slot 25+ shows the quest and its progress. Quest markers and `GetUnitQuestInfo` include it | |
-| 22 | Quest links (shift-click) for quests in slots 25..63 show the right level and XP | |
-| 23 | Zone headers 1–25 collapse and expand; headers past the 25th zone always show expanded (spec non-goal) | |
-| 24 | Built with `-DASCENSION_QUEST_LOG_64=OFF` (`cmake -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DASCENSION_QUEST_LOG_64=OFF -S . -B out\off`), against the same ql64 server: the genuine behaviour. The log holds 25 quests, the counter reads n/25, quests past 25 are in the Extra Quests window, and no CMSG `0x8F6` is sent | |
-| 25 | Track a quest in slot 26+, log out and back in: it is still tracked | |
-| 26 | With 30 quests and auto quest watch off, track quest #30 and turn in quest #1: no "Quest accepted", and #30 is still tracked | |
+| 1 | The quest log lists all 40 quests with zone headers, and the counter reads "Quests: 40/64" | PASS |
+| 2 | Quests 26–40 can be tracked in the watch frame; more than 25 tracked at once; the tracked set survives `/reload` | PASS (track/untrack, survives `/reload`) |
+| 3 | Quests 26–40 show POIs on the world map and minimap. The watch-frame POI buttons and the SuperTrack arrow work for them | PASS (world map; minimap / POI buttons / arrow not separately reported) |
+| 4 | Quests 26–40 show the scaled level colour and reward XP in the log | PASS |
+| 5 | Killing a mob for an overflow quest (e.g. quest 30) updates the tracker and the log's objective lines | PASS |
+| 6 | A quest item for an overflow quest (e.g. quest 35) drops as quest loot and shows the "x/y" message. Its quest objects sparkle | PASS (loot) |
+| 7 | Abandoning an overflow quest (e.g. quest 38) removes it from the log and from the server | PASS after fix aace4e9 (was a client crash: 0x6D4F80 called without `this`) |
+| 8 | An overflow quest (e.g. quest 33) can be shared with a party member | PASS |
+| 9 | Turning in a quest in slots 1–25 moves an overflow quest up; it is shown once, with no duplicate | PASS |
+| 10 | After `/reload`, all quests are still listed | PASS |
+| 11 | Logging out to another character shows that character's own log, with no leftovers | PASS |
+| 12 | The Extra Quests window never appears | PASS |
+| 13 | After setting `Quests.LogSize = 30` and running `reload config` while logged in, the counter reads n/30 without a relog | PASS |
+| 14 | Against the old server build (`var\build\coa`), the client behaves as a 25-quest client: 25 in the log, the rest in the Extra Quests window | PASS |
+| 15 | Accepting a 26th quest shows "Quest accepted" once and fires `QUEST_ACCEPTED` once, with a single `QUEST_LOG_UPDATE` per packet | PASS ("Quest accepted" once; event counts not separately checked) |
+| 16 | No "Quest accepted" message appears at login or after `/reload` | PASS |
+| 17 | A quest in slot 25+ that fails (an escort, or a timed quest that runs out) shows as failed in the log, with the "quest failed" error | PASS |
+| 18 | A timed quest in slot 25+ shows in the quest timer frame and counts down | PASS |
+| 19 | Abandoning or turning in a quest in slot 25+ fires `QUEST_REMOVED` for it and clears its map point | PASS |
+| 20 | An auto-complete quest in slot 25+ completes on its own once its objectives are done | PASS |
+| 21 | The tooltip of a mob or object for a quest in slot 25+ shows the quest and its progress. Quest markers and `GetUnitQuestInfo` include it | PASS |
+| 22 | Quest links (shift-click) for quests in slots 25..63 show the right level and XP | PASS |
+| 23 | Zone headers 1–25 collapse and expand; headers past the 25th zone always show expanded (spec non-goal) | PASS |
+| 24 | Built with `-DASCENSION_QUEST_LOG_64=OFF` (`cmake -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DASCENSION_QUEST_LOG_64=OFF -S . -B out\off`), against the same ql64 server: the genuine behaviour. The log holds 25 quests, the counter reads n/25, quests past 25 are in the Extra Quests window, and no CMSG `0x8F6` is sent || SKIPPED (user decision: no in-game run of the OFF build; it compiles in every task) |
+| 25 | Track a quest in slot 26+, log out and back in: it is still tracked | PASS |
+| 26 | With 30 quests and auto quest watch off, track quest #30 and turn in quest #1: no "Quest accepted", and #30 is still tracked | PASS |
