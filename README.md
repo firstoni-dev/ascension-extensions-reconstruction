@@ -84,6 +84,18 @@ cmake --build build
 The output is `build\Extensions.dll`. Place it next to `Ascension.exe`, which loads it itself (there is no
 injector).
 
+### The live client DLL
+
+The DLL shipped to players is built with the `ship` preset: interface hot patches, DBC streaming and the
+64-slot quest log on, native logon off.
+
+```bat
+cmake --preset ship
+cmake --build --preset ship
+```
+
+The output is `out-ship\Extensions.dll`.
+
 ### Optional: without the 64-quest log
 
 The quest log of 64 quests is compiled in by default. `-DASCENSION_QUEST_LOG_64=OFF` leaves it out and gives the

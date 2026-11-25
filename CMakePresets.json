@@ -1,0 +1,25 @@
+{
+  "version": 6,
+  "configurePresets": [
+    {
+      "name": "ship",
+      "displayName": "Live client DLL",
+      "description": "The Extensions.dll shipped to players: hot patch, DBC streaming and the 64-slot quest log on; native logon off.",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/out-ship",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo",
+        "ASCENSION_HOT_PATCH": "ON",
+        "ASCENSION_DBC_STREAM": "ON",
+        "ASCENSION_QUEST_LOG_64": "ON",
+        "ASCENSION_NATIVE_LOGON": "OFF"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "ship",
+      "configurePreset": "ship"
+    }
+  ]
+}
