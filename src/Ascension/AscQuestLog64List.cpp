@@ -313,7 +313,8 @@ namespace
 
     // The copy back into m_quests / m_sortTypes, for the readers not yet replaced: Task 11 (0x5DF610, 0x5DF700,
     // 0x5DF780, 0x5DFC40, 0x5E64D0, 0x5E67C0, 0x5E6240, 0x5E4FB0) and Task 12 (0x5E2B60, 0x5E2EB0,
-    // 0x5E3840, 0x5E6650), and the DLL's AscAttachFixes QuestRelevant (Task 13). Remove once they are.
+    // 0x5E3840, 0x5E6650), and the DLL's own readers of 0xC237B0 / 0xC23AD0 (Task 13): AscAttachFixes QuestRelevant,
+    // AscSmallApis ForOpenLoggedQuest and AscQuestSpellHide HiddenSpell. Remove once they are.
     void Sync() { Mirror(s_list, NativeRows(), NativeCount(), NativeSortTypes(), NativeNumSortTypes()); }
 
     const Row* QuestRow(int32_t index)
@@ -380,30 +381,31 @@ namespace
         return static_cast<int32_t>(EntryCount(entry, 0)) >= Q<int32_t>(q, kQPlayersKilled);
     }
 
-    // 0x5E10B0 CGQuestLog::HasNoObjectives
-    bool __cdecl HasNoObjectives(uint32_t index)
+    // 0x5E10B0 CGQuestLog::HasNoObjectives. Returns int: the original sets all of eax (xor eax,eax / setnl al) and its
+    // callers test eax.
+    int __cdecl HasNoObjectives(uint32_t index)
     {
         if (index >= s_list.count || s_list.rows[index].isHeader)
-            return false;
+            return 0;
         uint8_t* player = Player();
         if (!player)
-            return false;
+            return 0;
         const Row& row = s_list.rows[index];
         const uint8_t* entry = LogEntry(player, static_cast<uint32_t>(row.logSlot));
         const uint8_t* q = Quest(row.questId, 0x5DE930);
         if (!q || !entry || (EntryState(entry) & 2) || IsQuestFailed(index))
-            return false;
+            return 0;
         for (uint32_t i = 0; i < 4; ++i)
             if (Q<int32_t>(q, kQObjective + i * 4))
-                return false;
+                return 0;
         for (uint32_t i = 0; i < 6; ++i)
         {
             const int32_t item = Q<int32_t>(q, kQItem + i * 4);
             if (item && (item != Q<int32_t>(q, kQStartItem) || Q<int32_t>(q, kQItemCount + i * 4) > 1))
-                return false;
+                return 0;
         }
-        return !Q<int32_t>(q, kQPlayersKilled) && !(Q<uint32_t>(q, kQFlags) & 6) && !Q<int32_t>(q, kQFriendly) &&
-               !Q<int32_t>(q, kQHostile) && Q<int32_t>(q, kQMoney) >= 0;
+        return (!Q<int32_t>(q, kQPlayersKilled) && !(Q<uint32_t>(q, kQFlags) & 6) && !Q<int32_t>(q, kQFriendly) &&
+               !Q<int32_t>(q, kQHostile) && Q<int32_t>(q, kQMoney) >= 0) ? 1 : 0;
     }
 
     // 0x5E57E0 CGQuestLog::SetQuestExpired
@@ -674,7 +676,7 @@ namespace
                 ++CallbackCount();
                 continue;
             }
-            if (!reinterpret_cast<bool(__cdecl*)(int32_t)>(0x5E28B0)(questId))   // CGQuestLog::HasQuestPOI
+            if (!reinterpret_cast<uint8_t(__cdecl*)(int32_t)>(0x5E28B0)(questId))   // CGQuestLog::HasQuestPOI (al only)
             {
                 ++numUnknown;
                 unknown[slot] = questId;
