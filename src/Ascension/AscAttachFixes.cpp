@@ -91,6 +91,7 @@
 #include <Ascension/AscDbc.hpp>
 #include <Ascension/AscLogger.hpp>
 #include <Ascension/AscObjectAddon.hpp>
+#include <Ascension/AscQuestLog64.hpp>
 #include <Ascension/AscProfiler.hpp>
 #include <Ascension/AscRuntime.hpp>
 #include <Ascension/AscScript.hpp>
@@ -832,7 +833,26 @@ namespace
         return n;
     }
 
+#if !ASCENSION_QUEST_LOG_64
+    // The descriptor entry (+0x278, 0x14 each) of the first of the 25 slots holding `quest`, the walk stopping at
+    // the first empty slot; nullptr if none.
+    const uint8_t* LoggedQuest(const uint8_t* fields, uint32_t quest)
+    {
+        for (uint8_t slot = 0; slot < 0x19; ++slot)
+        {
+            const uint32_t id = *reinterpret_cast<const uint32_t*>(fields + 0x278 + slot * 0x14);
+            if (id == 0)
+                return nullptr;
+            if (id == quest)
+                return fields + 0x278 + slot * 0x14;
+        }
+        return nullptr;
+    }
+#endif
+
     // FUN_101940a0's view of the client's quest log (0xC237B0, 16-byte entries, count 0xC23AD0): {id, ?, done}.
+    // ASCENSION_QUEST_LOG_64: the DLL's list (128 rows) and the 64 slots, the first empty slot ending the
+    // descriptor's 25 only (AscQuestLog64::FindLoggedQuest).
     bool QuestRelevant(const uint8_t* player, uint32_t entry, void* cache, uint32_t cacheGet, uint32_t itemOffset)
     {
         typedef const uint8_t*(__thiscall* Get_t)(void*, uint32_t, void*, void*, void*, int);
@@ -840,41 +860,45 @@ namespace
         if (!tmpl)
             return false;
         const uint8_t* fields = *reinterpret_cast<const uint8_t* const*>(player + 8);
+#if ASCENSION_QUEST_LOG_64
+        uint32_t logCount = 0;
+        const uint32_t* rows = AscQuestLog64::QuestListRows(logCount);
+#else
         const uint32_t logCount = *reinterpret_cast<const uint32_t*>(0xC23AD0);
+        const uint32_t* rows = reinterpret_cast<const uint32_t*>(0xC237B0);
+#endif
         for (uint32_t e = 0; e < logCount; ++e)
         {
-            const uint32_t* log = reinterpret_cast<const uint32_t*>(0xC237B0 + e * 0x10);
+            const uint32_t* log = rows + e * 4;
             if (log[2] != 0)
                 continue;
             const uint32_t quest = log[0];
-            for (uint8_t slot = 0; slot < 0x19; ++slot)
+            // PLAYER_QUEST_LOG_x_1 is 32 bits. The original reads its low word (1008dea0 movzx word), so
+            // no quest above 65535 ever matched and custom quests drew no circle.
+#if ASCENSION_QUEST_LOG_64
+            const uint8_t* slotEntry = AscQuestLog64::FindLoggedQuest(fields, quest);
+#else
+            const uint8_t* slotEntry = LoggedQuest(fields, quest);
+#endif
+            if (!slotEntry)
+                continue;
+            const uint8_t* q = reinterpret_cast<Get_t>(0x67DE90)(reinterpret_cast<void*>(0xC5DA48), quest, nullptr, nullptr, nullptr, 0);
+            if (!q)
+                continue;
+            const uint64_t counts = *reinterpret_cast<const uint64_t*>(slotEntry + 8);
+            for (uint32_t i = 0; i < 4; ++i)
+                if (*reinterpret_cast<const uint32_t*>(q + 0x1C24 + i * 4) == entry &&
+                    *reinterpret_cast<const uint32_t*>(q + 0x1C34 + i * 4) != static_cast<uint16_t>(counts >> (i * 16)))
+                    return true;
+            for (uint32_t k = 0; k < 6; ++k)
             {
-                // PLAYER_QUEST_LOG_x_1 is 32 bits. The original reads its low word (1008dea0 movzx word), so
-                // no quest above 65535 ever matched and custom quests drew no circle.
-                const uint32_t id = *reinterpret_cast<const uint32_t*>(fields + 0x278 + slot * 0x14);
-                if (id == 0)
-                    break;
-                if (id != quest)
+                const uint32_t item = *reinterpret_cast<const uint32_t*>(tmpl + itemOffset + k * 4);
+                if (!item)
                     continue;
-                const uint8_t* q = reinterpret_cast<Get_t>(0x67DE90)(reinterpret_cast<void*>(0xC5DA48), quest, nullptr, nullptr, nullptr, 0);
-                if (!q)
-                    break;
-                const uint64_t counts = *reinterpret_cast<const uint64_t*>(fields + 0x280 + slot * 0x14);
-                for (uint32_t i = 0; i < 4; ++i)
-                    if (*reinterpret_cast<const uint32_t*>(q + 0x1C24 + i * 4) == entry &&
-                        *reinterpret_cast<const uint32_t*>(q + 0x1C34 + i * 4) != static_cast<uint16_t>(counts >> (i * 16)))
+                for (uint32_t i = 0; i < 6; ++i)
+                    if (item == *reinterpret_cast<const uint32_t*>(q + 0x1C44 + i * 4) &&
+                        *reinterpret_cast<const int32_t*>(q + 0x1C5C + i * 4) != CountItem(player, item))
                         return true;
-                for (uint32_t k = 0; k < 6; ++k)
-                {
-                    const uint32_t item = *reinterpret_cast<const uint32_t*>(tmpl + itemOffset + k * 4);
-                    if (!item)
-                        continue;
-                    for (uint32_t i = 0; i < 6; ++i)
-                        if (item == *reinterpret_cast<const uint32_t*>(q + 0x1C44 + i * 4) &&
-                            *reinterpret_cast<const int32_t*>(q + 0x1C5C + i * 4) != CountItem(player, item))
-                            return true;
-                }
-                break;
             }
         }
         return false;

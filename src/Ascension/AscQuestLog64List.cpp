@@ -1,0 +1,2089 @@
+// Quest log of 64 quests, part 2: the CGQuestLog list (build, sort, collapse, index lookups, per-quest queries) and
+// its Lua API over 64 slots. Not in the genuine DLL; built with ASCENSION_QUEST_LOG_64. Each client function below is
+// replaced whole (AscRuntime::ReplaceFunction) by a port of the CoA64 body (WoW/Source/Ui/QuestLog.cpp,
+// QuestLog_Scripts.cpp; the address is its OFFSET tag), with 64-slot bounds and a DLL-owned list.
+//
+// The list. The client's CGQuestLog::m_quests (0xC237B0, 50 x 16 bytes, count 0xC23AD0) and m_sortTypes (0xC23618,
+// 25 ints, count 0xC23AD4) are too small for 64 quests and their zone headers; the list below holds 128 rows and 64
+// sort types (as CoA64 sizes them). Three techniques: functions with list logic or descriptor slot walks are ported;
+// functions that only index the list get their operands pointed at the DLL list (kOperandPatches); the four
+// leaderboard functions also get their one descriptor read replaced by a call (kSlotSites). The DLL's own readers use
+// AscQuestLog64::QuestListRows. Only when a function stays unpatched (bytes not matching) are the first 50 rows and 25
+// sort types copied back into the old arrays (Mirror; see Sync).
+//
+// World checks and the refresh. CheckForQuestItemLoot gets a slot site and a 64-slot bound,
+// Packet_Group_17 its slot walk replaced by a call, CanHighlight is ported; after every 0x8F7 Refresh runs what
+// OnUpdateQuest (0x6DF370) runs for a quest update-field change, for the changed slots 25..63.
+//
+// The watches. CGQuestLog::m_questWatches (0xC23680, 25 x 12 bytes) moves to s_watches (64) by the same
+// operand patches, applied to the watch functions as one group; the timer Lua functions are ported.
+//
+// The POIs. CGQuestLog::m_questPOIs (0xC23B00, 25 x 0x30 bytes) moves to s_pois (64) the same way, as a
+// second group; UpdatePOIIcons (stack arrays of 25) and GetPOIQuestIDByVisibleIndex are ported.
+//
+// The 25-bit collapse filter (cvar questLogCollapseFilter) is unchanged (spec non-goal): sort types past the 25th
+// have no collapse bit and always show expanded.
+#include <PatchConfig.hpp>
+
+#if ASCENSION_QUEST_LOG_64
+#include <Ascension/AscBindings.hpp>
+#include <Ascension/AscLog.hpp>
+#include <Ascension/AscLua.hpp>
+#include <Ascension/AscQuestLog64.hpp>
+#include <Ascension/AscRuntime.hpp>
+#include <Ascension/AscScript.hpp>
+#include <cmath>
+#include <cstdint>
+#include <cstdlib>
+#include <cstring>
+#include <ctime>
+#include <initializer_list>
+#include <Windows.h>
+
+// The list itself, with no client access (tests/quest_log_64.py compiles this block).
+namespace AscQuestLog64List
+{
+    constexpr uint32_t kRows = AscQuestLog64::kMaxSlots * 2;   // one quest plus at most one header per slot
+    constexpr uint32_t kNativeRows = 50, kNativeSortTypes = 25;
+    constexpr uint32_t kCollapseBits = 25;
+
+    struct Row
+    {
+        int32_t questId;    // the sort type for a header
+        int32_t logSlot;
+        int32_t isHeader;
+        int32_t expired;
+    };
+    static_assert(sizeof(Row) == 16, "CGQuestLog::m_quests entry");
+
+    struct List
+    {
+        Row rows[kRows];
+        uint32_t count;
+        int32_t sortTypes[AscQuestLog64::kMaxSlots];
+        uint32_t numSortTypes;
+    };
+
+    // The index of `type` among the first `limit` sort types; `limit` when absent.
+    uint32_t FindSort(const List& l, int32_t type, uint32_t limit)
+    {
+        uint32_t i = 0;
+        while (i < limit && l.sortTypes[i] != type)
+            ++i;
+        return i;
+    }
+
+    // Update's step for one quest: its row, then a header for its sort type when the type is new. Returns the
+    // quest's row.
+    uint32_t Append(List& l, int32_t questId, uint32_t slot, int32_t sortType)
+    {
+        const uint32_t row = l.count;
+        if (l.count < kRows)
+            l.rows[l.count++] = Row{questId, static_cast<int32_t>(slot), 0, 0};
+        if (FindSort(l, sortType, l.numSortTypes) == l.numSortTypes && l.numSortTypes < AscQuestLog64::kMaxSlots)
+        {
+            l.sortTypes[l.numSortTypes++] = sortType;
+            if (l.count < kRows)
+                l.rows[l.count++] = Row{sortType, 0, 1, 0};
+        }
+        return row;
+    }
+
+    // A non-header row with this sort index is folded away (no collapse bit past the 25th type: never).
+    bool Collapsed(uint32_t sortIndex, int32_t filter)
+    {
+        return sortIndex < kCollapseBits && !((1u << sortIndex) & static_cast<uint32_t>(filter));
+    }
+
+    // Update keeps the sort types it had, negated when expanded, to carry each header's state to its new index.
+    void SaveSortTypes(const List& l, int32_t filter, int32_t* out)
+    {
+        for (uint32_t i = 0; i < l.numSortTypes; ++i)
+            out[i] = i >= kCollapseBits || ((1u << i) & static_cast<uint32_t>(filter)) ? -l.sortTypes[i] : l.sortTypes[i];
+    }
+
+    // The filter after the sort types were rebuilt and sorted: a type seen collapsed stays collapsed, any other is
+    // expanded. Bits only for the first 25 types.
+    int32_t MergeFilter(const List& l, int32_t filter, const int32_t* old, uint32_t numOld)
+    {
+        uint32_t f = static_cast<uint32_t>(filter);
+        for (uint32_t i = 0; i < l.numSortTypes && i < kCollapseBits; ++i)
+        {
+            uint32_t j = 0;
+            for (; j < numOld; ++j)
+            {
+                if (old[j] == l.sortTypes[i])
+                {
+                    f &= ~(1u << i);
+                    break;
+                }
+                if (old[j] == -l.sortTypes[i])
+                {
+                    f |= 1u << i;
+                    break;
+                }
+            }
+            if (j >= numOld)
+                f |= 1u << i;
+        }
+        return static_cast<int32_t>(f);
+    }
+
+    // One row as QSortQuestLogEntries (0x5E08F0) sees it. `known`: the quest record is cached (headers: always).
+    struct SortKey
+    {
+        bool header;
+        bool known;
+        uint32_t sort;     // index in the sort types, 0 when absent
+        int32_t level;     // -1 already replaced by the player's level
+        const char* name;
+    };
+
+    // The sort index QSortQuestLogEntries uses: searched over all 64 entries, 0 when absent.
+    uint32_t SortIndex(const List& l, int32_t type)
+    {
+        const uint32_t i = FindSort(l, type, AscQuestLog64::kMaxSlots);
+        return i < AscQuestLog64::kMaxSlots ? i : 0;
+    }
+
+    // QSortQuestLogEntries: shown rows before folded ones, then by sort type, header first, then by level, then name.
+    int Compare(const SortKey& a, const SortKey& b, int32_t filter, int (*names)(const char*, const char*))
+    {
+        if ((!a.header && !a.known) || (!b.header && !b.known))
+            return 0;
+        const bool hiddenA = !a.header && Collapsed(a.sort, filter);
+        const bool hiddenB = !b.header && Collapsed(b.sort, filter);
+        if (hiddenA)
+            return hiddenB ? 0 : 1;
+        if (hiddenB)
+            return -1;
+        if (a.sort != b.sort)
+            return a.sort < b.sort ? -1 : 1;
+        if (a.header)
+            return -1;
+        if (b.header)
+            return 1;
+        if (a.level == b.level)
+            return names(a.name, b.name);
+        return a.level >= b.level ? 1 : -1;
+    }
+
+    // GetQuestIndex (0x5DEEB0): the 1-based row of a quest, 0 when absent. Walks every row, as the original walks
+    // all 50.
+    uint32_t QuestIndex(const List& l, int32_t questId)
+    {
+        for (uint32_t i = 0; i < kRows; ++i)
+            if (!l.rows[i].isHeader && l.rows[i].questId == questId)
+                return i + 1;
+        return 0;
+    }
+
+    // The copy the client's own arrays keep for readers not yet ported: the first 50 rows and 25 sort types, counts
+    // clamped, the rest zeroed.
+    void Mirror(const List& l, Row* rows, uint32_t& count, int32_t* sortTypes, uint32_t& numSortTypes)
+    {
+        count = l.count < kNativeRows ? l.count : kNativeRows;
+        memset(rows, 0, kNativeRows * sizeof(Row));
+        memcpy(rows, l.rows, count * sizeof(Row));
+        numSortTypes = l.numSortTypes < kNativeSortTypes ? l.numSortTypes : kNativeSortTypes;
+        memset(sortTypes, 0, kNativeSortTypes * sizeof(int32_t));
+        memcpy(sortTypes, l.sortTypes, numSortTypes * sizeof(int32_t));
+    }
+
+    // An operand that addressed the old list, pointed at the DLL list: 0xC23AD0 (the count) -> `count`, a row field
+    // 0xC237B0 + k -> `rows` + k.
+    uint32_t Relocated(uint32_t original, uint32_t rows, uint32_t count)
+    {
+        return original == 0xC23AD0 ? count : rows + (original - 0xC237B0);
+    }
+
+    // CGQuestLog::m_questWatches entry (0xC23680, 25 of them, count 0xC23AE0); the DLL keeps 64 (CoA64 m_questWatches).
+    struct Watch
+    {
+        int32_t questId;
+        int32_t expireTime;   // 0: no timeout
+        float distance;       // SortQuestWatches
+    };
+    static_assert(sizeof(Watch) == 12, "CGQuestLog::m_questWatches entry");
+
+    // An operand that addressed the old watch array, pointed at the DLL's: 0xC23680 + k -> `watches` + k. k may be
+    // negative: RemoveQuestWatch writes the last entry as 0xC23674/0xC23678[count * 12].
+    uint32_t RelocatedWatch(uint32_t original, uint32_t watches) { return watches + (original - 0xC23680); }
+
+    // `cmp r32, imm8` bounds, each given as its 3 bytes little-endian (83 modrm imm8; modrm F8+r is cmp r32). 0 when
+    // the bytes are not of that form.
+    // A 50-row walk `cmp r32, 32h` -> `cmp r8, 80h` (128 rows; 80 modrm imm8 is cmp r8, so r must be eax..ebx). The
+    // sites count up from 0 by 1 and branch with jb, so the unsigned byte compare is exact for 0..128.
+    uint32_t RowBound(uint32_t original)
+    {
+        const uint32_t modrm = (original >> 8) & 0xFF;
+        if ((original & 0xFF) != 0x83 || (modrm & 0xF8) != 0xF8 || (modrm & 7) > 3 || (original >> 16) != 0x32)
+            return 0;
+        return 0x800080 | (modrm << 8);
+    }
+    // A 25-watch bound `cmp r32, 19h` -> `cmp r32, 40h` (64 watches; still a positive imm8).
+    uint32_t WatchBound(uint32_t original)
+    {
+        const uint32_t modrm = (original >> 8) & 0xFF;
+        if ((original & 0xFF) != 0x83 || (modrm & 0xF8) != 0xF8 || (original >> 16) != 0x19)
+            return 0;
+        return 0x400083 | (modrm << 8);
+    }
+
+    // Seconds a timed quest has left, as GetQuestTimers / GetQuestIndexForTimer compute them (negative: expired);
+    // 32-bit wrapping like the original's add/sub.
+    int32_t TimerLeft(int32_t timeOffset, uint32_t entryTime, int32_t now)
+    {
+        return static_cast<int32_t>(static_cast<uint32_t>(timeOffset) + entryTime - static_cast<uint32_t>(now) - 1u);
+    }
+
+    enum X86Reg : uint8_t { kEax = 0, kEcx = 1, kEdx = 2, kEbx = 3, kEsi = 6, kEdi = 7 };
+
+    // The code replacing a slot site at `start` (`size` bytes, filled with nops after it):
+    //     push slot / push dword [ebp + player] / call target / add esp, 8 / [mov dest, eax] / jmp short done
+    // Returns the bytes used (16 at most).
+    uint32_t SlotSiteCode(uint8_t* code, uint32_t size, uint32_t start, uint32_t done, X86Reg slot, X86Reg dest, int8_t player,
+                          uint32_t target)
+    {
+        memset(code, 0x90, size);
+        uint32_t n = 0;
+        code[n++] = static_cast<uint8_t>(0x50 + slot);
+        code[n++] = 0xFF;
+        code[n++] = 0x75;
+        code[n++] = static_cast<uint8_t>(player);
+        code[n++] = 0xE8;
+        const uint32_t rel = target - (start + n + 4);
+        memcpy(code + n, &rel, 4);
+        n += 4;
+        code[n++] = 0x83;
+        code[n++] = 0xC4;
+        code[n++] = 0x08;
+        if (dest != kEax)
+        {
+            code[n++] = 0x8B;
+            code[n++] = static_cast<uint8_t>(0xC0 | (dest << 3));
+        }
+        code[n++] = 0xEB;
+        code[n] = static_cast<uint8_t>(done - (start + n + 1));
+        return n + 1;
+    }
+
+    // Slot sites. A descriptor slot walk bounded by its byte offset, `cmp r, 21Ch` (0x28 + 25 * 0x14: the end of
+    // m_playerQuestLog behind player + 0x1008) -> 0x528 (64 slots; the entries past 25 come from SiteSlotEntry). 0
+    // for any other value.
+    uint32_t SlotBytesBound(uint32_t original)
+    {
+        return original == 0x28 + AscQuestLog64::kNativeSlots * 0x14 ? 0x28 + AscQuestLog64::kMaxSlots * 0x14 : 0;
+    }
+
+    // The code replacing Packet_Group_17's (0x6D8030) slot walk at `start` (`size` bytes, nops after it):
+    //     mov edi, [ebp-4] / push edi / call target / add esp, 4 / mov ebx, eax / jmp short done
+    // edi = the quest id, ebx = whether its log entry is failed (state bit 1), as the walk leaves them. Returns the
+    // bytes used (16).
+    uint32_t FailedSiteCode(uint8_t* code, uint32_t size, uint32_t start, uint32_t done, uint32_t target)
+    {
+        memset(code, 0x90, size);
+        const uint8_t head[] = {0x8B, 0x7D, 0xFC, 0x57, 0xE8};
+        memcpy(code, head, sizeof(head));
+        uint32_t n = sizeof(head);
+        const uint32_t rel = target - (start + n + 4);
+        memcpy(code + n, &rel, 4);
+        n += 4;
+        const uint8_t tail[] = {0x83, 0xC4, 0x04, 0x8B, 0xD8, 0xEB};
+        memcpy(code + n, tail, sizeof(tail));
+        n += sizeof(tail);
+        code[n] = static_cast<uint8_t>(done - (start + n + 1));
+        return n + 1;
+    }
+
+    // CGQuestLog::m_questPOIs entry (0xC23B00, 25 of them); the DLL keeps 64 (CoA64 m_questPOIs). `blob*` is the
+    // TSGrowableArray<QuestPOIBlob> (0x34-byte blobs; the client allocates them, ShutdownGame frees them).
+    struct Poi
+    {
+        int32_t questId;
+        uint32_t blobAlloc;
+        uint32_t blobCount;
+        uint32_t blobData;      // QuestPOIBlob* (32-bit client)
+        uint32_t blobChunk;
+        int32_t iconMapId;
+        int32_t iconObjective;
+        uint32_t iconFloor;
+        int32_t iconX;
+        int32_t iconY;
+        uint8_t visible;
+        uint8_t unused[3];
+        uint32_t objectiveMask;
+    };
+    static_assert(sizeof(Poi) == 0x30, "CGQuestLog::m_questPOIs entry");
+
+    // An operand that addressed the old POI array, pointed at the DLL's: 0xC23B00 + k -> `pois` + k.
+    uint32_t RelocatedPoi(uint32_t original, uint32_t pois) { return pois + (original - 0xC23B00); }
+    // A 4-byte POI bound: the byte offset 25 * 0x30 (`cmp r, 4B0h`) -> 64 * 0x30, the count 25 (`mov r, 19h`) -> 64.
+    uint32_t PoiImm(uint32_t original)
+    {
+        return original == 25 * sizeof(Poi) ? AscQuestLog64::kMaxSlots * sizeof(Poi)
+               : original == 25              ? AscQuestLog64::kMaxSlots
+                                             : 0;
+    }
+
+    // x*x + y*y with the client's 32-bit wrapping (imul / add).
+    int32_t DistanceSq(int32_t x, int32_t y)
+    {
+        return static_cast<int32_t>(static_cast<uint32_t>(x) * static_cast<uint32_t>(x) +
+                                    static_cast<uint32_t>(y) * static_cast<uint32_t>(y));
+    }
+
+    // UpdatePOIIcons (0x5E2EB0), the overlap pass: for `iterations` rounds, every pair of active icons closer than
+    // `radius` pushes the movable ones apart (an exact overlap gets one of three nudges), each round's forces scaled
+    // down to `maxStep`; stops early when nothing pushes. Indices are POI slots (0..63; the original's arrays held 25).
+    void SpreadIcons(Poi* pois, const int32_t* active, int32_t numActive, const uint8_t* movable, float radius,
+                     float radiusSq, float maxStep, int32_t iterations)
+    {
+        static const int32_t nudges[3][2] = {{0, 2}, {1, -2}, {-2, 1}};
+        uint32_t nudge = 0;
+        for (int32_t iteration = 0; iteration < iterations; ++iteration)
+        {
+            int32_t forces[AscQuestLog64::kMaxSlots][2] = {};
+            for (int32_t a = 0; a < numActive; ++a)
+            {
+                const int32_t indexA = active[a];
+                const int32_t ax = pois[indexA].iconX, ay = pois[indexA].iconY;
+                for (int32_t b = a + 1; b < numActive; ++b)
+                {
+                    const int32_t indexB = active[b];
+                    int32_t dx = ax - pois[indexB].iconX, dy = ay - pois[indexB].iconY;
+                    const int32_t distanceSq = DistanceSq(dx, dy);
+                    if (!(static_cast<double>(distanceSq) < radiusSq))
+                        continue;
+                    if (!distanceSq)
+                    {
+                        dx = nudges[nudge][0];
+                        dy = nudges[nudge][1];
+                        nudge = (nudge + 1) % 3;
+                    }
+                    const double scale = radius / sqrt(static_cast<double>(dx) * dx + static_cast<double>(dy) * dy);
+                    const int32_t fx = static_cast<int32_t>(dx * scale), fy = static_cast<int32_t>(scale * dy);
+                    if (movable[indexA])
+                    {
+                        forces[indexA][0] += fx;
+                        forces[indexA][1] += fy;
+                    }
+                    if (distanceSq && movable[indexB])
+                    {
+                        forces[indexB][0] -= fx;
+                        forces[indexB][1] -= fy;
+                    }
+                }
+            }
+            double maxForce = -9999999.0;
+            for (int32_t k = 0; k < numActive; ++k)
+                for (int32_t c = 0; c < 2; ++c)
+                    if (fabs(static_cast<double>(forces[active[k]][c])) > maxForce)
+                        maxForce = fabs(static_cast<double>(forces[active[k]][c]));
+            if (0.0 == maxForce)
+                break;
+            if (maxStep < maxForce)
+            {
+                const double scale = maxStep / maxForce;
+                for (int32_t k = 0; k < numActive; ++k)
+                    for (int32_t c = 0; c < 2; ++c)
+                        forces[active[k]][c] = static_cast<int32_t>(forces[active[k]][c] * scale);
+            }
+            for (int32_t k = 0; k < numActive; ++k)
+            {
+                pois[active[k]].iconX += forces[active[k]][0];
+                pois[active[k]].iconY += forces[active[k]][1];
+            }
+        }
+    }
+
+    // UpdatePOIIcons, completed quests (cvar POIShiftComplete = `shift` > 0.001): each icon that lies within
+    // shift * 100 (squared distance) of an earlier one chains to it, and every chained icon after the first is moved
+    // by the next of four offsets times `shift`.
+    void ShiftComplete(Poi* pois, const int32_t* complete, int32_t numComplete, float shift)
+    {
+        int32_t chain[AscQuestLog64::kMaxSlots] = {};
+        const double threshold = shift * 100.0;
+        for (int32_t c = 0; c < numComplete - 1; ++c)
+        {
+            const int32_t indexC = complete[c + 1];
+            const int32_t cx = pois[indexC].iconX, cy = pois[indexC].iconY;
+            for (int32_t d = c; d >= 0; --d)
+            {
+                const Poi& other = pois[complete[d]];
+                if (static_cast<double>(DistanceSq(cx - other.iconX, cy - other.iconY)) < threshold)
+                {
+                    chain[indexC] = chain[complete[d]] + 1;
+                    break;
+                }
+            }
+        }
+        static const int32_t offsets[4][2] = {{50, 86}, {-86, 50}, {-50, 86}, {-90, 10}};
+        uint32_t offset = 0;
+        for (int32_t k = 1; k < numComplete; ++k)
+        {
+            const int32_t index = complete[k];
+            if (!chain[index])
+                continue;
+            const int32_t ox = offsets[offset][0], oy = offsets[offset][1];
+            offset = (offset + 1) & 3;
+            pois[index].iconX += static_cast<int32_t>(ox * static_cast<double>(shift));
+            pois[index].iconY += static_cast<int32_t>(static_cast<double>(shift) * oy);
+        }
+    }
+}
+
+namespace
+{
+    using namespace AscQuestLog64List;
+    using AscQuestLog64::kMaxSlots;
+
+    List s_list = {};
+
+    // Client globals (CoA64 STATIC tags).
+    Row* NativeRows() { return reinterpret_cast<Row*>(0xC237B0); }                       // m_quests[50]
+    uint32_t& NativeCount() { return *reinterpret_cast<uint32_t*>(0xC23AD0); }            // m_numQuest
+    int32_t* NativeSortTypes() { return reinterpret_cast<int32_t*>(0xC23618); }          // m_sortTypes[25]
+    uint32_t& NativeNumSortTypes() { return *reinterpret_cast<uint32_t*>(0xC23AD4); }     // m_numSortTypes
+    int32_t& Selected() { return *reinterpret_cast<int32_t*>(0xC23AD8); }                // m_selectedQuest
+    int32_t& Abandon() { return *reinterpret_cast<int32_t*>(0xC23ADC); }                 // m_abandonQuest
+    uint32_t& NumWatches() { return *reinterpret_cast<uint32_t*>(0xC23AE0); }            // m_numQuestWatches
+    uint32_t& NumShown() { return *reinterpret_cast<uint32_t*>(0xC23AE4); }              // m_numShownQuests
+    int32_t& TimeOffset() { return *reinterpret_cast<int32_t*>(0xC23AE8); }              // m_timeOffset
+    uint8_t& TrackedLoaded() { return *reinterpret_cast<uint8_t*>(0xC23AF0); }           // m_trackedQuestsLoaded
+    uint32_t& CallbackCount() { return *reinterpret_cast<uint32_t*>(0xC23AF4); }         // s_questCallbackCount
+    int32_t& NextQuestUpdate() { return *reinterpret_cast<int32_t*>(0xC23AF8); }         // m_nextQuestUpdate
+    // m_questWatches (0xC23680, 25 entries) moves to s_watches (64) once every watch function is patched
+    // (PatchOperands); until then (bytes not matching) the client array stays in use.
+    Watch s_watches[AscQuestLog64::kMaxSlots] = {};
+    bool s_watchesRelocated = false;
+    int32_t WatchQuest(uint32_t i)
+    {
+        return s_watchesRelocated ? s_watches[i].questId : *reinterpret_cast<int32_t*>(0xC23680 + i * 12);
+    }
+    // m_questPOIs (0xC23B00, 25 entries) moves to s_pois (64) once every POI function is patched (PatchOperands);
+    // until then the client array (25) stays in use, and the two ports below read it.
+    Poi s_pois[AscQuestLog64::kMaxSlots] = {};
+    bool s_poisRelocated = false;
+    Poi* Pois() { return s_poisRelocated ? s_pois : reinterpret_cast<Poi*>(0xC23B00); }
+    uint32_t NumPois() { return s_poisRelocated ? AscQuestLog64::kMaxSlots : AscQuestLog64::kNativeSlots; }
+    uint8_t* CollapseCVar() { return *reinterpret_cast<uint8_t**>(0xBD0A34); }           // s_cvQuestLogCollapseFilter
+    int32_t CollapseFilter() { return *reinterpret_cast<int32_t*>(CollapseCVar() + 0x30); }
+
+    constexpr int kQuestLogUpdate = 293;   // SCRIPT_EVENT_QUEST_LOG_UPDATE
+    constexpr uint32_t kTypePlayer = 0x10;
+    const char kFile[] = "AscQuestLog64List.cpp";
+
+    // Client functions (all checked in IDA, 2026-11-25).
+    uint8_t* Player()
+    {
+        const uint64_t guid = reinterpret_cast<uint64_t(__cdecl*)()>(0x4D3790)();   // ClntObjMgrGetActivePlayer
+        return reinterpret_cast<uint8_t*(__cdecl*)(uint32_t, uint32_t, uint32_t, const char*, int)>(0x4D4DB0)(
+            static_cast<uint32_t>(guid), static_cast<uint32_t>(guid >> 32), kTypePlayer, kFile, 0);
+    }
+    // g_questDBCache.GetRecord (0x67DE90 on 0xC5DA48); `callback` 0x5DE930 QuestQueryCallback, 0x5DE8F0 the counter.
+    const uint8_t* Quest(int32_t id, uint32_t callback = 0)
+    {
+        uint32_t none[2] = {0, 0};
+        return reinterpret_cast<const uint8_t*(__thiscall*)(void*, int32_t, uint32_t*, uint32_t, void*, int)>(0x67DE90)(
+            reinterpret_cast<void*>(0xC5DA48), id, none, callback, nullptr, 0);
+    }
+    template <class T> T Q(const uint8_t* quest, uint32_t offset) { T v; memcpy(&v, quest + offset, sizeof(T)); return v; }
+    // QuestCache fields (offsets read from the functions replaced here).
+    constexpr uint32_t kQLevel = 0x08, kQSort = 0x10, kQType = 0x14, kQPlayers = 0x18, kQFriendly = 0x1C,
+                       kQFriendlyAmount = 0x20, kQHostile = 0x24, kQHostileAmount = 0x28, kQMoney = 0x34,
+                       kQStartItem = 0x4C, kQFlags = 0x50, kQName = 0xB4, kQObjective = 0x1C24, kQObjectiveCount = 0x1C34,
+                       kQItem = 0x1C44, kQItemCount = 0x1C5C, kQPlayersKilled = 0x2098;
+    const uint8_t* DbRecord(uint32_t db, int32_t id)   // WowClientDB::GetRecord 0x65C290
+    {
+        return reinterpret_cast<const uint8_t*(__thiscall*)(void*, int32_t)>(0x65C290)(reinterpret_cast<void*>(db), id);
+    }
+    void SetCollapseFilter(int32_t value)   // CVar::Set(value, 1, 0, 0, 1) 0x766940
+    {
+        reinterpret_cast<int(__thiscall*)(void*, int32_t, int, int, int, int)>(0x766940)(CollapseCVar(), value, 1, 0, 0, 1);
+    }
+    void Signal(int event) { reinterpret_cast<void(__cdecl*)(int)>(0x615020)(event); }   // Script_SendUniqueSignal
+    void QueryQuestGiverStatus() { reinterpret_cast<void(__cdecl*)()>(0x6D50C0)(); }
+    int SortNames(const char* a, const char* b)   // SStrSortUTF8I 0x76EC80 (stdcall)
+    {
+        return reinterpret_cast<int(__stdcall*)(const char*, const char*, int)>(0x76EC80)(a, b, 0x7FFFFFFF);
+    }
+
+    // The player's quest log entry for `slot` (0x14 bytes): 0..24 the descriptor, as CGPlayer::GetQuestLogEntry
+    // (0x5E0870) reads it through player + 0x1008; 25..63 the 0x8F7 store; nullptr past 63.
+    const uint8_t* LogEntry(const uint8_t* player, uint32_t slot)
+    {
+        const uint8_t* fields = *reinterpret_cast<const uint8_t* const*>(player + 0x1008);   // descriptor + 0x250
+        if (!fields && slot < AscQuestLog64::kNativeSlots)
+            return nullptr;
+        return AscQuestLog64::SlotEntry(fields ? fields - 0x250 : nullptr, slot);
+    }
+
+    // 0x5E0870 CGPlayer::GetQuestLogEntry (thiscall, `self` = player + 0x1008; __fastcall with an unused edx has the
+    // same stack contract). 0..24 the descriptor; 25..63 the 0x8F7 store, which only holds the active player's log
+    // (the original's `slot > 25` let slot 25 read past the descriptor's log).
+    const uint8_t* __fastcall GetQuestLogEntry(const uint8_t* const* self, void*, int32_t slot)
+    {
+        if (slot < 0)
+            return nullptr;
+        if (slot < static_cast<int32_t>(AscQuestLog64::kNativeSlots))
+            return *self + 0x28 + slot * 0x14;
+        const uint8_t* active = Player();
+        if (!active || slot >= static_cast<int32_t>(kMaxSlots) ||
+            *reinterpret_cast<const uint8_t* const*>(active + 0x1008) != *self)
+            return nullptr;
+        return LogEntry(active, static_cast<uint32_t>(slot));
+    }
+    uint32_t EntryQuest(const uint8_t* e) { return *reinterpret_cast<const uint32_t*>(e); }
+    uint32_t EntryState(const uint8_t* e) { return *reinterpret_cast<const uint32_t*>(e + 4); }
+    uint16_t EntryCount(const uint8_t* e, uint32_t i) { return *reinterpret_cast<const uint16_t*>(e + 8 + i * 2); }
+    uint32_t EntryTime(const uint8_t* e) { return *reinterpret_cast<const uint32_t*>(e + 16); }
+
+    // The copy back into m_quests / m_sortTypes, for a client function whose bytes did not match and stayed unpatched
+    // (a list function, the watch group or the POI group; PatchOperands sets s_mirrorNeeded). Once every patch
+    // applies no client function reads those arrays, and the DLL's own readers use AscQuestLog64::QuestListRows, so
+    // nothing is copied.
+    bool s_mirrorNeeded = false;
+    void Sync()
+    {
+        if (s_mirrorNeeded)
+            Mirror(s_list, NativeRows(), NativeCount(), NativeSortTypes(), NativeNumSortTypes());
+    }
+
+    const Row* QuestRow(int32_t index)
+    {
+        return index >= 0 && static_cast<uint32_t>(index) < s_list.count && !s_list.rows[index].isHeader
+                   ? &s_list.rows[index] : nullptr;
+    }
+
+    // ---- per-quest queries -------------------------------------------------------------------------------------
+
+    // 0x5DEE30 CGQuestLog::IsQuestFailed
+    int __cdecl IsQuestFailed(uint32_t index)
+    {
+        return index < s_list.count && !s_list.rows[index].isHeader && s_list.rows[index].expired;
+    }
+
+    // 0x5E0EA0 CGQuestLog::IsQuestCompleteEx. The item count passes 0, not 8: AscAttachLate's byte patch at
+    // 0x5E1071 (push 8 -> push 0), kept here because this replaces the function it patches.
+    int __cdecl IsQuestCompleteEx(uint32_t index, int8_t strict)
+    {
+        if (index >= s_list.count || s_list.rows[index].isHeader)
+            return 0;
+        uint8_t* player = Player();
+        if (!player)
+            return 0;
+        const Row& row = s_list.rows[index];
+        const uint8_t* entry = LogEntry(player, static_cast<uint32_t>(row.logSlot));
+        const uint8_t* q = Quest(row.questId, 0x5DE930);
+        if (!q || !entry || (EntryState(entry) & 2) || IsQuestFailed(index))
+            return 0;
+
+        const uint32_t special = Q<uint32_t>(q, kQFlags) & 6;
+        if (!special && !Q<int32_t>(q, kQFriendly) && !Q<int32_t>(q, kQHostile) && !Q<int32_t>(q, kQMoney))
+        {
+            bool objectives = false;
+            for (uint32_t i = 0; i < 4; ++i)
+                objectives |= Q<int32_t>(q, kQObjective + i * 4) != 0;
+            for (uint32_t i = 0; i < 6; ++i)
+                objectives |= Q<int32_t>(q, kQItem + i * 4) != 0;
+            if (strict && !objectives && !Q<int32_t>(q, kQPlayersKilled))
+                return 0;
+        }
+        if (special && !(EntryState(entry) & 1))
+            return 0;
+        typedef int(__cdecl* Rep_t)(int32_t);   // GetRepListRepValue 0x5D05B0
+        const Rep_t rep = reinterpret_cast<Rep_t>(0x5D05B0);
+        if (Q<int32_t>(q, kQFriendly) && rep(Q<int32_t>(q, kQFriendly)) < Q<int32_t>(q, kQFriendlyAmount))
+            return 0;
+        if (Q<int32_t>(q, kQHostile) && rep(Q<int32_t>(q, kQHostile)) > Q<int32_t>(q, kQHostileAmount))
+            return 0;
+        const int32_t money = Q<int32_t>(q, kQMoney);
+        if (money < 0 && reinterpret_cast<uint32_t(__thiscall*)(void*)>(0x51A2B0)(player) < static_cast<uint32_t>(-money))
+            return 0;
+        for (uint32_t i = 0; i < 4; ++i)
+            if (Q<int32_t>(q, kQObjective + i * 4) && EntryCount(entry, i) < Q<uint32_t>(q, kQObjectiveCount + i * 4))
+                return 0;
+        typedef int(__thiscall* Count_t)(void*, int32_t, int);   // CGBag_C::GetItemTypeCount 0x754D00 on player+0x18F0
+        for (uint32_t i = 0; i < 6; ++i)
+        {
+            const int32_t item = Q<int32_t>(q, kQItem + i * 4);
+            if (item && reinterpret_cast<Count_t>(0x754D00)(player + 0x18F0, item, 0) < Q<int32_t>(q, kQItemCount + i * 4))
+                return 0;
+        }
+        return static_cast<int32_t>(EntryCount(entry, 0)) >= Q<int32_t>(q, kQPlayersKilled);
+    }
+
+    // 0x5E10B0 CGQuestLog::HasNoObjectives. Returns int: the original sets all of eax (xor eax,eax / setnl al) and its
+    // callers test eax.
+    int __cdecl HasNoObjectives(uint32_t index)
+    {
+        if (index >= s_list.count || s_list.rows[index].isHeader)
+            return 0;
+        uint8_t* player = Player();
+        if (!player)
+            return 0;
+        const Row& row = s_list.rows[index];
+        const uint8_t* entry = LogEntry(player, static_cast<uint32_t>(row.logSlot));
+        const uint8_t* q = Quest(row.questId, 0x5DE930);
+        if (!q || !entry || (EntryState(entry) & 2) || IsQuestFailed(index))
+            return 0;
+        for (uint32_t i = 0; i < 4; ++i)
+            if (Q<int32_t>(q, kQObjective + i * 4))
+                return 0;
+        for (uint32_t i = 0; i < 6; ++i)
+        {
+            const int32_t item = Q<int32_t>(q, kQItem + i * 4);
+            if (item && (item != Q<int32_t>(q, kQStartItem) || Q<int32_t>(q, kQItemCount + i * 4) > 1))
+                return 0;
+        }
+        return (!Q<int32_t>(q, kQPlayersKilled) && !(Q<uint32_t>(q, kQFlags) & 6) && !Q<int32_t>(q, kQFriendly) &&
+               !Q<int32_t>(q, kQHostile) && Q<int32_t>(q, kQMoney) >= 0) ? 1 : 0;
+    }
+
+    // 0x5E57E0 CGQuestLog::SetQuestExpired
+    int __cdecl SetQuestExpired(uint32_t index)
+    {
+        if (index >= s_list.count || IsQuestCompleteEx(index, 1))
+            return 0;
+        s_list.rows[index].expired = 1;
+        Sync();
+        if (Player())
+            QueryQuestGiverStatus();
+        return 1;
+    }
+
+    // 0x5E5840 CGQuestLog::SetQuestExpiredByID (matches header rows too, as the original does)
+    int __cdecl SetQuestExpiredByID(int32_t questId)
+    {
+        uint32_t index = 0;
+        while (index < s_list.count && s_list.rows[index].questId != questId)
+            ++index;
+        if (index >= s_list.count)
+            return 0;
+        return SetQuestExpired(index);
+    }
+
+    // 0x5DEE60 CGQuestLog::IsQuestExpiredByID (first row with the id, header or not)
+    int __cdecl IsQuestExpiredByID(int32_t questId)
+    {
+        for (uint32_t i = 0; i < s_list.count; ++i)
+            if (s_list.rows[i].questId == questId)
+                return !s_list.rows[i].isHeader && s_list.rows[i].expired;
+        return 0;
+    }
+
+    // 0x5DECC0 IsDailyQuest
+    int __cdecl IsDailyQuest(int32_t index)
+    {
+        const Row* r = QuestRow(index);
+        const uint8_t* q = r ? Quest(r->questId, 0x5DE930) : nullptr;
+        return q ? Q<uint32_t>(q, kQFlags) & 0x1000 : 0;
+    }
+
+    // 0x5DED30 GetQuestSuggestedPlayers
+    int __cdecl GetQuestSuggestedPlayers(int32_t index)
+    {
+        const Row* r = QuestRow(index);
+        const uint8_t* q = r ? Quest(r->questId, 0x5DE930) : nullptr;
+        return q ? Q<int32_t>(q, kQPlayers) : 0;
+    }
+
+    // 0x5E0000 GetQuestTitle: the quest's title, or the header's zone (AreaTable 0xAD314C +0x2C) / sort
+    // (QuestSort 0xAD4448 +4) name.
+    const char* __cdecl GetQuestTitle(int32_t index)
+    {
+        if (index < 0 || static_cast<uint32_t>(index) >= s_list.count)
+            return nullptr;
+        const Row& r = s_list.rows[index];
+        if (!r.isHeader)
+            return reinterpret_cast<const char*(__cdecl*)(int32_t)>(0x5DEC70)(r.questId);   // GetQuestTitleText
+        if (r.questId > 0)
+        {
+            const uint8_t* area = DbRecord(0xAD314C, r.questId);
+            return area ? Q<const char*>(area, 0x2C) : nullptr;
+        }
+        if (r.questId == 0)
+            return "Missing header! (quest designers)";
+        const uint8_t* sort = DbRecord(0xAD4448, -r.questId);
+        return sort ? Q<const char*>(sort, 4) : nullptr;
+    }
+
+    // 0x5E0070 GetQuestTag: QuestInfo (0xAD4424) name of the quest's type.
+    const char* __cdecl GetQuestTag(int32_t index)
+    {
+        const Row* r = QuestRow(index);
+        const uint8_t* q = r ? Quest(r->questId, 0x5DE930) : nullptr;
+        const uint8_t* info = q ? DbRecord(0xAD4424, Q<int32_t>(q, kQType)) : nullptr;
+        return info ? Q<const char*>(info, 4) : nullptr;
+    }
+
+    // ---- index lookups -----------------------------------------------------------------------------------------
+
+    // 0x5DE8C0 CGQuestLog::GetQuestLogSlot
+    int __cdecl GetQuestLogSlot(int32_t index)
+    {
+        const Row* r = QuestRow(index);
+        return r ? r->logSlot : -1;
+    }
+
+    // 0x5DEC40 CGQuestLog::GetQuestAt
+    int __cdecl GetQuestAt(int32_t index)
+    {
+        const Row* r = QuestRow(index);
+        return r ? r->questId : 0;
+    }
+
+    // 0x5DEEB0 CGQuestLog::GetQuestIndex
+    int __cdecl GetQuestIndex(int32_t questId) { return static_cast<int>(QuestIndex(s_list, questId)); }
+
+    // 0x5DEBD0 CGQuestLog::GetSelectedLogEntry
+    int __cdecl GetSelectedLogEntry()
+    {
+        for (uint32_t i = 0; i < s_list.count; ++i)
+            if (!s_list.rows[i].isHeader && s_list.rows[i].questId == Selected())
+                return static_cast<int>(i);
+        return -1;
+    }
+
+    // 0x5E00E0 CGQuestLog::IsSelectedQuestExpired
+    int __cdecl IsSelectedQuestExpired()
+    {
+        const uint32_t i = static_cast<uint32_t>(GetSelectedLogEntry());
+        return i < s_list.count && !s_list.rows[i].isHeader && s_list.rows[i].expired;
+    }
+
+    // 0x5DFFA0 CGQuestLog::SetSelectedQuest: clears the quest point, selects the row's quest and shows its point.
+    int __cdecl SetSelectedQuest(int32_t index)
+    {
+        if (Selected())
+            reinterpret_cast<void(__cdecl*)(float, float, int, const char*)>(0x7F4930)(
+                0.0f, 0.0f, 0, reinterpret_cast<const char*>(0x9E14FF));
+        if (index < 0 || static_cast<uint32_t>(index) >= s_list.count)
+            Selected() = 0;
+        else if (!s_list.rows[index].isHeader)
+        {
+            Selected() = s_list.rows[index].questId;
+            reinterpret_cast<void(__cdecl*)()>(0x5DEB60)();   // AddQuestPointDisplay
+        }
+        return 0;
+    }
+
+    // 0x5E11D0 CGQuestLog::IsOnQuest
+    int __cdecl IsOnQuest(int32_t questId)
+    {
+        const uint8_t* player = Player();
+        if (!player || (*reinterpret_cast<const uint32_t*>(player + 0xBC) & 0x10000))
+            return 0;
+        for (uint32_t slot = 0; slot < kMaxSlots; ++slot)
+            if (const uint8_t* e = LogEntry(player, slot))
+                if (EntryQuest(e) && static_cast<int32_t>(EntryQuest(e)) == questId)
+                    return 1;
+        return 0;
+    }
+
+    // 0x5E0CC0 CGQuestLog::AbandonSelectedQuest: CMSG_QUESTLOG_REMOVE_QUEST (0x6D4F80) for the quest's slot.
+    // 0x6D4F80 is CGPlayer_C::RemoveQuest, __thiscall(player, slot), ret 4: the original pushes the row's whole +4
+    // dword and sets ecx to the player (mov ecx, eax). Its own body ignores ecx, but AscGossipQuest detours it as
+    // __fastcall(player, edx, slot) and reads player + 8, so a stray ecx crashed it (AV reading 0x0000000E).
+    void __cdecl AbandonSelectedQuest()
+    {
+        if (!Abandon())
+            return;
+        uint8_t* player = Player();
+        if (!player)
+            return;
+        for (uint32_t i = 0; i < kRows; ++i)
+            if (!s_list.rows[i].isHeader && s_list.rows[i].questId == Abandon())
+            {
+                reinterpret_cast<void(__thiscall*)(void*, uint32_t)>(0x6D4F80)(
+                    player, static_cast<uint32_t>(s_list.rows[i].logSlot));
+                return;
+            }
+    }
+
+    // ---- list build, sort and collapse -------------------------------------------------------------------------
+
+    // 0x5DEAE0 GetQuestSortId
+    int __cdecl GetQuestSortId(uint32_t index)
+    {
+        if (index >= s_list.count)
+            return -1;
+        int32_t type = s_list.rows[index].questId;
+        if (!s_list.rows[index].isHeader)
+        {
+            const uint8_t* q = Quest(type);
+            if (!q)
+                return -1;
+            type = Q<int32_t>(q, kQSort);
+        }
+        const uint32_t i = FindSort(s_list, type, s_list.numSortTypes);
+        return i < s_list.numSortTypes ? static_cast<int>(i) : -1;
+    }
+
+    SortKey Key(const Row& r, const uint8_t* player)
+    {
+        SortKey k = {r.isHeader != 0, true, 0, 0, nullptr};
+        if (k.header)
+        {
+            k.sort = SortIndex(s_list, r.questId);
+            return k;
+        }
+        const uint8_t* q = Quest(r.questId);
+        k.known = q != nullptr;
+        if (!q)
+            return k;
+        k.sort = SortIndex(s_list, Q<int32_t>(q, kQSort));
+        k.level = Q<int32_t>(q, kQLevel);
+        if (k.level == -1 && player)
+            k.level = *reinterpret_cast<const int32_t*>(*reinterpret_cast<const uint8_t* const*>(player + 0xD0) + 0xC0);
+        k.name = reinterpret_cast<const char*>(q + kQName);
+        return k;
+    }
+
+    // 0x5E08F0 QSortQuestLogEntries (its only caller is FilterAndSortQuests, replaced below, so it is not hooked)
+    int __cdecl CompareRows(const void* a, const void* b)
+    {
+        const uint8_t* player = Player();
+        return Compare(Key(*static_cast<const Row*>(a), player), Key(*static_cast<const Row*>(b), player),
+                       CollapseFilter(), &SortNames);
+    }
+
+    // 0x5E0B80 CGQuestLog::FilterAndSortQuests
+    void __cdecl FilterAndSortQuests()
+    {
+        qsort(s_list.rows, s_list.count, sizeof(Row), &CompareRows);
+        NumShown() = s_list.count;
+        for (uint32_t i = 0; i < s_list.count; ++i)
+            if (!s_list.rows[i].isHeader && Collapsed(static_cast<uint32_t>(GetQuestSortId(i)), CollapseFilter()))
+                --NumShown();
+        Sync();
+    }
+
+    // 0x5E0C00 CGQuestLog::CollapseHeader. A header past the 25th sort type has no collapse bit (spec non-goal).
+    void __cdecl CollapseHeader(uint32_t index, int32_t collapse)
+    {
+        if (index < s_list.count && s_list.rows[index].isHeader)
+        {
+            const uint32_t i = FindSort(s_list, s_list.rows[index].questId, s_list.numSortTypes);
+            if (i == s_list.numSortTypes || i >= kCollapseBits)
+                return;
+            const int32_t filter = CollapseFilter();
+            const int32_t bit = static_cast<int32_t>(1u << i);
+            SetCollapseFilter(collapse ? filter & ~bit : filter | bit);
+        }
+        else
+            SetCollapseFilter((collapse != 0) - 1);
+        FilterAndSortQuests();
+        Signal(kQuestLogUpdate);
+    }
+
+    // 0x5E6940 CGQuestLog::Update: rebuilds the list from the 64 slots, sorts it, keeps each header's collapse
+    // state, drops watches of quests no longer in the log, and asks for unknown POIs.
+    void __cdecl Update(int32_t rebuild)
+    {
+        if (!rebuild)
+        {
+            Signal(kQuestLogUpdate);
+            return;
+        }
+        if (CallbackCount())
+            return;
+        uint8_t* player = Player();
+        if (!player)
+            return;
+
+        int32_t filter = CollapseFilter();
+        int32_t oldSortTypes[kMaxSlots];
+        const uint32_t numOld = s_list.numSortTypes;
+        SaveSortTypes(s_list, filter, oldSortTypes);
+
+        s_list = {};
+        CallbackCount() = 0;
+        uint32_t numUnknown = 0;
+        int32_t unknown[kMaxSlots] = {};
+        const int32_t timeOffset = TimeOffset();
+
+        for (uint32_t slot = 0; slot < kMaxSlots; ++slot)
+        {
+            const uint8_t* entry = LogEntry(player, slot);
+            const int32_t questId = entry ? static_cast<int32_t>(EntryQuest(entry)) : 0;
+            if (questId <= 0)
+                continue;
+            const uint8_t* q = Quest(questId, 0x5DE8F0);   // QuestQueryCounterCallback reruns Update
+            if (!q)
+            {
+                ++CallbackCount();
+                continue;
+            }
+            if (!reinterpret_cast<uint8_t(__cdecl*)(int32_t)>(0x5E28B0)(questId))   // CGQuestLog::HasQuestPOI (al only)
+            {
+                ++numUnknown;
+                unknown[slot] = questId;
+            }
+            const uint32_t row = Append(s_list, questId, slot, Q<int32_t>(q, kQSort));
+            const int32_t time = static_cast<int32_t>(EntryTime(entry));
+            if (time && !(EntryState(entry) & 2) &&
+                timeOffset + time - static_cast<int32_t>(::time(nullptr)) - 1 < 0)
+                SetQuestExpired(row);
+        }
+
+        qsort(s_list.sortTypes, s_list.numSortTypes, sizeof(int32_t),
+              reinterpret_cast<int(__cdecl*)(const void*, const void*)>(0x5DFDC0));   // QSortQuestSortTypes
+        filter = MergeFilter(s_list, filter, oldSortTypes, numOld);
+        SetCollapseFilter(filter);
+        FilterAndSortQuests();
+
+        if (!TrackedLoaded() && s_list.count)
+            reinterpret_cast<void(__cdecl*)()>(0x5E65B0)();   // CGQuestLog::LoadTrackedQuests
+
+        bool found = true;
+        for (uint32_t i = 0; i < NumWatches(); ++i)
+        {
+            if (!found)
+                --i;
+            found = false;
+            for (uint32_t j = 0; j < s_list.count; ++j)
+                if (!s_list.rows[j].isHeader && s_list.rows[j].questId == WatchQuest(i))
+                {
+                    found = true;
+                    break;
+                }
+            if (!found)
+                reinterpret_cast<void(__cdecl*)(int32_t)>(0x5DEA60)(WatchQuest(i));   // CGQuestLog::RemoveQuestWatch
+        }
+
+        Signal(kQuestLogUpdate);
+
+        if (numUnknown)
+        {
+            AscScript::Packet packet(0x1E3);   // CMSG_QUEST_POI_QUERY
+            packet.U32(numUnknown);
+            for (uint32_t i = 0; i < kMaxSlots; ++i)
+                if (unknown[i])
+                    packet.U32(static_cast<uint32_t>(unknown[i]));
+            packet.Send();
+        }
+
+        if (NextQuestUpdate() && static_cast<int32_t>(::time(nullptr)) >= NextQuestUpdate())
+        {
+            AscScript::Packet packet(0x1CE);   // CMSG_QUERY_TIME
+            packet.Send();
+            NextQuestUpdate() = 0;
+        }
+    }
+
+    // 0x5E71A0 CGQuestLog::InitializeGame: the original, then the DLL list emptied with the client's.
+    typedef int(__cdecl* InitializeGame_t)();
+    InitializeGame_t g_initializeGame = nullptr;
+    int __cdecl InitializeGame()
+    {
+        const int r = g_initializeGame();
+        s_list = {};
+        memset(s_watches, 0, sizeof(s_watches));   // the original zeroes m_questWatches and its count
+        return r;
+    }
+
+    // ---- Lua API (QuestLog_Scripts.cpp) ------------------------------------------------------------------------
+
+    using namespace AscLua;
+
+    // 0x5DF010 Script_GetNumQuestLogEntries: shown rows, quests
+    int __cdecl Script_GetNumQuestLogEntries(lua_State* L)
+    {
+        lua_pushnumber(L, NumShown());
+        uint32_t quests = 0;
+        for (uint32_t i = 0; i < s_list.count; ++i)
+            quests += !s_list.rows[i].isHeader;
+        lua_pushnumber(L, quests);
+        return 2;
+    }
+
+    // 0x5E5CC0 Script_GetQuestLogTitle: title, level, tag, suggestedGroup, isHeader, isCollapsed, isComplete,
+    // isDaily, questID [, displayQuestID]
+    int __cdecl Script_GetQuestLogTitle(lua_State* L)
+    {
+        if (!lua_isnumber(L, 1))
+            luaL_error(L, "Usage: GetQuestLogTitle(index)");
+        const int32_t index = static_cast<int32_t>(lua_tonumber(L, 1)) - 1;
+        lua_pushstring(L, GetQuestTitle(index));
+        const Row* quest = QuestRow(index);
+        lua_pushnumber(L, quest ? reinterpret_cast<int(__cdecl*)(int32_t)>(0x5E0D20)(quest->questId) : 0);   // GetQuestLevel
+        lua_pushstring(L, GetQuestTag(index));
+        lua_pushnumber(L, GetQuestSuggestedPlayers(index));
+        if (index >= 0 && static_cast<uint32_t>(index) < s_list.count && s_list.rows[index].isHeader)
+        {
+            lua_pushnumber(L, 1.0);
+            const uint32_t sort = static_cast<uint32_t>(GetQuestSortId(static_cast<uint32_t>(index)));
+            if (sort >= kCollapseBits || ((1u << sort) & static_cast<uint32_t>(CollapseFilter())))
+                lua_pushnil(L);
+            else
+                lua_pushnumber(L, 1.0);
+        }
+        else
+        {
+            lua_pushnil(L);
+            lua_pushnil(L);
+        }
+
+        const uint8_t* player = Player();
+        if (!player)
+            lua_pushnil(L);
+        else
+        {
+            const uint8_t* entry = quest && static_cast<uint32_t>(quest->logSlot) < kMaxSlots
+                                       ? LogEntry(player, static_cast<uint32_t>(quest->logSlot)) : nullptr;
+            if ((entry && (EntryState(entry) & 2)) || (quest && quest->expired))
+                lua_pushnumber(L, -1.0);
+            else if (IsQuestCompleteEx(static_cast<uint32_t>(index), 1))
+                lua_pushnumber(L, 1.0);
+            else
+                lua_pushnil(L);
+        }
+
+        if (IsDailyQuest(index))
+            lua_pushnumber(L, 1.0);
+        else
+            lua_pushnil(L);
+        lua_pushnumber(L, quest ? quest->questId : 0);
+        const uint8_t* cvar = reinterpret_cast<uint8_t*(__cdecl*)(const char*)>(0x767440)("displayQuestID");   // CVar::Lookup
+        if (!cvar || !*reinterpret_cast<const int32_t*>(cvar + 0x30))
+            return 9;
+        lua_pushboolean(L, 1);
+        return 10;
+    }
+
+    // The selected quest's log entry for the two Script_*s below (slot 0 when nothing is selected, as the original).
+    const uint8_t* SelectedEntry(const uint8_t* player)
+    {
+        const int32_t index = GetSelectedLogEntry();
+        const uint32_t slot = index < 0 ? 0 : static_cast<uint32_t>(s_list.rows[index].logSlot);
+        return slot < kMaxSlots ? LogEntry(player, slot) : nullptr;
+    }
+
+    // 0x5E4320 Script_GetQuestLogTimeLeft
+    int __cdecl Script_GetQuestLogTimeLeft(lua_State* L)
+    {
+        const uint8_t* player = Player();
+        const uint8_t* entry = player ? SelectedEntry(player) : nullptr;
+        const int32_t offset = TimeOffset();
+        if (!entry || !EntryTime(entry) || (EntryState(entry) & 2) || !offset)
+        {
+            lua_pushnil(L);
+            return 1;
+        }
+        int32_t left = offset + static_cast<int32_t>(EntryTime(entry)) - static_cast<int32_t>(::time(nullptr)) - 1;
+        lua_pushnumber(L, left < 0 ? 0 : left);
+        return 1;
+    }
+
+    // 0x5E43F0 Script_IsCurrentQuestFailed
+    int __cdecl Script_IsCurrentQuestFailed(lua_State* L)
+    {
+        const uint8_t* player = Player();
+        const uint8_t* entry = player ? SelectedEntry(player) : nullptr;
+        if (entry && ((EntryState(entry) & 2) || IsSelectedQuestExpired()))
+            lua_pushnumber(L, 1.0);
+        else
+            lua_pushnil(L);
+        return 1;
+    }
+
+    // 0x5E4070 Script_IsUnitOnQuest(index, unit): a party member's log has 25 slots (the server sends no others);
+    // the player's own has 64.
+    int __cdecl Script_IsUnitOnQuest(lua_State* L)
+    {
+        if (!lua_isnumber(L, 1) || !lua_isstring(L, 2))
+            luaL_error(L, "Usage: IsUnitOnQuest(index, \"unit\")");
+        const Row* quest = QuestRow(static_cast<int32_t>(lua_tonumber(L, 1)) - 1);
+        if (quest && quest->questId)
+        {
+            uint64_t guid = reinterpret_cast<uint64_t(__cdecl*)(const char*)>(0x60C1C0)(lua_tolstring(L, 2, nullptr));
+            if (reinterpret_cast<int(__cdecl*)(const uint64_t*)>(0x52C680)(&guid))   // CGPartyInfo::IsMember
+            {
+                uint8_t* member = reinterpret_cast<uint8_t*(__cdecl*)(uint32_t, uint32_t, uint32_t, const char*, int)>(0x4D4DB0)(
+                    static_cast<uint32_t>(guid), static_cast<uint32_t>(guid >> 32), kTypePlayer, kFile, 0);
+                if (member && !(*reinterpret_cast<const uint32_t*>(member + 0xBC) & 0x10000))
+                {
+                    const bool self = member == Player();
+                    const uint32_t slots = self ? kMaxSlots : AscQuestLog64::kNativeSlots;
+                    for (uint32_t slot = 0; slot < slots; ++slot)
+                    {
+                        const uint8_t* e = self ? LogEntry(member, slot)
+                                                : reinterpret_cast<const uint8_t*(__thiscall*)(void*, uint32_t)>(0x5E0870)(
+                                                      member + 0x1008, slot);   // CGPlayer::GetQuestLogEntry
+                        if (e && static_cast<int32_t>(EntryQuest(e)) == quest->questId)
+                        {
+                            lua_pushnumber(L, 1.0);
+                            return 1;
+                        }
+                    }
+                }
+            }
+        }
+        lua_pushnil(L);
+        return 1;
+    }
+
+    // ---- quest timers -----------------------------------------------------------------------------------------------
+
+    // The running timed quest at list row `i`: its log entry, or nullptr (header, slot outside 0..63, no timer, failed).
+    const uint8_t* TimedEntry(uint8_t* player, uint32_t i)
+    {
+        if (i >= s_list.count || s_list.rows[i].isHeader)
+            return nullptr;
+        const int32_t slot = s_list.rows[i].logSlot;
+        if (slot < 0 || slot >= static_cast<int32_t>(kMaxSlots))
+            return nullptr;
+        const uint8_t* entry = LogEntry(player, static_cast<uint32_t>(slot));
+        return entry && EntryTime(entry) && !(EntryState(entry) & 2) ? entry : nullptr;
+    }
+
+    // 0x5E6240 Script_GetQuestTimers: the seconds left of each running timed quest, in list order. A quest whose
+    // time ran out is marked expired, announced (CGGameUI::DisplayError ERR_QUEST_FAILED_S) and signalled once.
+    // Returns 0 with nothing pushed when there is no player.
+    int __cdecl Script_GetQuestTimers(lua_State* L)
+    {
+        uint8_t* player = Player();
+        if (!player)
+            return 0;
+        const uint32_t numQuest = s_list.count;
+        const int32_t timeOffset = TimeOffset();
+        int count = 0;
+        bool failed = false;
+        for (uint32_t i = 0; i < numQuest; ++i)
+        {
+            const uint8_t* entry = TimedEntry(player, i);
+            if (!entry || s_list.rows[i].expired)
+                continue;
+            const int32_t left = TimerLeft(timeOffset, EntryTime(entry), static_cast<int32_t>(::time(nullptr)));
+            if (left < 0)
+            {
+                if (SetQuestExpired(i))
+                {
+                    if (const uint8_t* q = Quest(static_cast<int32_t>(EntryQuest(entry)), 0x5DE980))   // DisplayQuestFailed
+                        reinterpret_cast<void(__cdecl*)(int, const char*)>(0x5216F0)(0x94, reinterpret_cast<const char*>(q + kQName));
+                    failed = true;
+                }
+            }
+            else
+            {
+                ++count;
+                lua_checkstack(L, 1);
+                lua_pushnumber(L, left);
+            }
+        }
+        if (failed)
+            Signal(kQuestLogUpdate);
+        return count;
+    }
+
+    // 0x5E4FB0 Script_GetQuestIndexForTimer(n): the list index (1-based) of the n-th running timed quest, nil if none.
+    int __cdecl Script_GetQuestIndexForTimer(lua_State* L)
+    {
+        if (!lua_isnumber(L, 1))
+            luaL_error(L, "Usage: GetQuestIndexForTimer(index)");
+        const int32_t index = static_cast<int32_t>(static_cast<int64_t>(lua_tonumber(L, 1))) - 1;
+        if (uint8_t* player = Player())
+        {
+            const uint32_t numQuest = s_list.count;
+            const int32_t timeOffset = TimeOffset();
+            int32_t found = 0;
+            for (uint32_t i = 0; i < numQuest; ++i)
+            {
+                const uint8_t* entry = TimedEntry(player, i);
+                if (!entry || TimerLeft(timeOffset, EntryTime(entry), static_cast<int32_t>(::time(nullptr))) < 0)
+                    continue;
+                if (found == index)
+                {
+                    lua_pushnumber(L, i + 1);
+                    return 1;
+                }
+                ++found;
+            }
+        }
+        lua_pushnil(L);
+        return 1;
+    }
+
+    // ---- POIs -------------------------------------------------------------------------------------------------------
+
+    // An inline WowClientDB::GetRecord as UpdatePOIIcons does it: the table's min id at `minAt`, the max id 4 bytes
+    // before it, the row pointers 0x10 after it.
+    const uint8_t* InlineRecord(uint32_t minAt, int32_t id)
+    {
+        const int32_t min = *reinterpret_cast<const int32_t*>(minAt), max = *reinterpret_cast<const int32_t*>(minAt - 4);
+        return id < min || id > max ? nullptr : (*reinterpret_cast<const uint8_t* const* const*>(minAt + 0x10))[id - min];
+    }
+
+    // 0x5E2EB0 CGQuestLog::UpdatePOIIcons: picks each POI's best blob on the current (dungeon) map, then spreads the
+    // icons of active quests and fans out those of completed ones. Ported because its local arrays (chain,
+    // completeList, movable, activeList, forces) hold 25 and live in its stack frame; CoA64 sizes them 64.
+    void __cdecl UpdatePOIIcons()
+    {
+        const uint8_t* poiCVar = *reinterpret_cast<const uint8_t* const*>(0xBD0A3C);   // g_questPOICVar
+        if (!Q<int32_t>(poiCVar, 0x30))
+            return;
+        uint8_t* player = Player();
+        if (!player)
+            return;
+
+        typedef int32_t(__cdecl* AreaId_t)();   // CGWorldMap::GetCurrentAreaID 0x543770
+        const AreaId_t currentArea = reinterpret_cast<AreaId_t>(0x543770);
+        const int32_t orphanZone = *reinterpret_cast<const int32_t*>(0xACCF10);   // CGWorldMap::m_currentOrphanZone
+        const uint8_t* dungeon = InlineRecord(0xAD36E4,   // g_dungeonMapDB, m_currentDungeonMap
+                                              orphanZone != -1 ? *reinterpret_cast<const int32_t*>(0xACCF0C) : -1);
+        const uint8_t* area = nullptr;
+        if (!dungeon)
+        {
+            area = InlineRecord(0xAD4ECC, currentArea());   // g_worldMapAreaDB
+            if (currentArea() == -1 || !area)
+                return;
+        }
+
+        float position[3];   // CGObject_C::GetPosition, vtable +0x2C (thiscall, out C3Vector)
+        typedef void(__thiscall* Position_t)(void*, float*);
+        (*reinterpret_cast<Position_t*>(*reinterpret_cast<uint8_t**>(player) + 0x2C))(player, position);
+        typedef uint8_t(__cdecl* OnDungeon_t)(const void*, int32_t, int32_t, int32_t);   // 0x5E0180, al
+        typedef uint8_t(__cdecl* OnMap_t)(const void*, int32_t, int32_t);                // 0x5E0110, al
+        const OnDungeon_t onDungeonMap = reinterpret_cast<OnDungeon_t>(0x5E0180);   // IsPOIVisibleOnDungeonMap
+        const OnMap_t onCurrentMap = reinterpret_cast<OnMap_t>(0x5E0110);           // IsPOIOnCurrentMap
+
+        Poi* pois = Pois();
+        const uint32_t numPois = NumPois();
+        int32_t numActive = 0, numComplete = 0;
+        int32_t completeList[kMaxSlots], activeList[kMaxSlots];
+        uint8_t movable[kMaxSlots] = {};
+        for (uint32_t i = 0; i < numPois; ++i)
+        {
+            Poi& poi = pois[i];
+            const uint8_t* blobs = reinterpret_cast<const uint8_t*>(poi.blobData);
+            float bestDistance = 3.4028235e38f;
+            int32_t best = -1, bestPriority = 10;
+            for (int32_t j = 0; j < static_cast<int32_t>(poi.blobCount); ++j)
+            {
+                // QuestPOIBlob: +0x10 center x/y, +0x1C objective, +0x20 map, +0x24 world map area, +0x28 floor,
+                // +0x2C flags, +0x30 priority.
+                const uint8_t* blob = blobs + j * 0x34;
+                const int32_t objective = Q<int32_t>(blob, 0x1C);
+                const uint32_t mask = poi.objectiveMask;
+                if (!((objective == -1 && mask == 0xFFFFFFFF) || (mask != 0xFFFFFFFF && ((1u << (objective & 31)) & mask))))
+                    continue;   // the client's shl takes the count mod 32
+                uint8_t visible;
+                if (dungeon)
+                    visible = onDungeonMap(blob + 0x10, Q<int32_t>(blob, 0x20), Q<int32_t>(blob, 0x28), Q<int32_t>(dungeon, 0));
+                else
+                {
+                    if (!area || ((Q<uint8_t>(blob, 0x2C) & 4) && Q<int32_t>(blob, 0x24) != Q<int32_t>(area, 0)))
+                        continue;
+                    visible = onCurrentMap(blob + 0x10, Q<int32_t>(blob, 0x20), Q<int32_t>(area, 4));
+                }
+                if (!visible)
+                    continue;
+                const int32_t priority = Q<int32_t>(blob, 0x30);
+                const double dy = fabs(static_cast<double>(position[1]) - Q<int32_t>(blob, 0x14));
+                const double dx = fabs(static_cast<double>(position[0]) - Q<int32_t>(blob, 0x10));
+                const double distance = dx * dx + dy * dy;
+                if (priority < bestPriority || (bestDistance > distance && priority == bestPriority))
+                {
+                    bestDistance = static_cast<float>(distance);
+                    best = j;
+                    bestPriority = priority;
+                }
+            }
+            if (best == -1)
+            {
+                poi.iconMapId = 0;
+                poi.iconObjective = 0;
+                poi.iconFloor = 0;
+                poi.iconX = 999999;
+                poi.iconY = 999999;
+                continue;
+            }
+            const uint8_t* blob = blobs + best * 0x34;
+            poi.iconMapId = Q<int32_t>(blob, 0x20);
+            poi.iconObjective = Q<int32_t>(blob, 0x1C);
+            poi.iconFloor = Q<uint32_t>(blob, 0x28);
+            poi.iconX = Q<int32_t>(blob, 0x10);
+            poi.iconY = Q<int32_t>(blob, 0x14);
+            // The original's inline GetQuestIndex walks 50 rows; the list has 128 (CoA64).
+            if (IsQuestCompleteEx(QuestIndex(s_list, poi.questId) - 1, 1))
+                completeList[numComplete++] = static_cast<int32_t>(i);
+            else
+            {
+                movable[i] = Q<int32_t>(blob, 4) != 1;   // the blob's point count
+                activeList[numActive++] = static_cast<int32_t>(i);
+            }
+        }
+        if (!area)
+            return;
+
+        int32_t zoneId;
+        const int32_t continent = *reinterpret_cast<const int32_t*>(0xACCF04);   // CGWorldMap::m_currentContinent
+        if (continent < 0)
+            zoneId = *reinterpret_cast<const int32_t*>(0xACCF10);
+        else
+        {
+            // CGWorldMap::m_continents.m_data (0x10028-byte entries): +4 area id, +0x10 zones; m_currentZone 0xACCF08.
+            const uint8_t* info = *reinterpret_cast<const uint8_t* const*>(0xBE8F10) + continent * 0x10028;
+            const int32_t zone = *reinterpret_cast<const int32_t*>(0xACCF08);
+            zoneId = zone < 0 ? Q<int32_t>(info, 4) : Q<const int32_t*>(info, 0x10)[zone];
+        }
+        if (zoneId == -1)
+            return;
+
+        const float overlap = *reinterpret_cast<const float*>(0xAD1014);   // m_questIconOverlapDist
+        const int32_t span = static_cast<int32_t>(fabs(static_cast<double>(Q<float>(area, 0x10)) - Q<float>(area, 0x14)));
+        const double r = span * (static_cast<double>(overlap) + overlap) * 0.0009765625;
+        for (int32_t k = 0; k < numActive; ++k)
+            pois[activeList[k]].iconY = static_cast<int32_t>(pois[activeList[k]].iconY * static_cast<double>(0.75001878f));
+        SpreadIcons(pois, activeList, numActive, movable, static_cast<float>(r), static_cast<float>(r * r),
+                    static_cast<float>(0.05f * r), *reinterpret_cast<const int32_t*>(0xAD1264));   // s_poiOverlapIterations
+        const uint8_t* shift = *reinterpret_cast<const uint8_t* const*>(0xC23AFC);   // s_cvPOIShiftComplete
+        if (shift && Q<float>(shift, 0x2C) > 0.001f)
+            ShiftComplete(pois, completeList, numComplete, Q<float>(shift, 0x2C));
+        for (int32_t k = 0; k < numActive; ++k)
+            pois[activeList[k]].iconY = static_cast<int32_t>(pois[activeList[k]].iconY * static_cast<double>(1.3333f));
+    }
+
+    // 0x5E3840 CGQuestLog::GetPOIQuestIDByVisibleIndex: the quest of the index-th visible POI, counting completed
+    // (or objective-less) quests first, then watched quests in watch order, then the rest; -1 when none. Ported, not
+    // patched: its watch walks would tie a POI byte mismatch to the watch group.
+    int __cdecl GetPOIQuestIDByVisibleIndex(int32_t index)
+    {
+        const Poi* pois = Pois();
+        const uint32_t numPois = NumPois();
+        if (static_cast<uint32_t>(index) >= numPois)
+            return -1;
+        typedef int(__cdecl* PoiIndex_t)(int32_t);   // CGQuestLog::GetQuestPOIIndex 0x5E2900 (POI group)
+        const PoiIndex_t poiIndex = reinterpret_cast<PoiIndex_t>(0x5E2900);
+        const auto finished = [](int32_t questId) {
+            return IsQuestCompleteEx(static_cast<uint32_t>(GetQuestIndex(questId) - 1), 1) ||
+                   HasNoObjectives(static_cast<uint32_t>(GetQuestIndex(questId) - 1));
+        };
+
+        int32_t visible = 0;
+        for (uint32_t i = 0; i < numPois; ++i)
+            if (pois[i].visible && finished(pois[i].questId) && index == visible++)
+                return pois[i].questId;
+        for (int32_t i = 0; i < static_cast<int32_t>(NumWatches()); ++i)
+        {
+            const int32_t questId = WatchQuest(static_cast<uint32_t>(i));
+            if (finished(questId))
+                continue;
+            const int32_t poi = poiIndex(questId);
+            if (poi >= 0 && pois[poi].visible && index == visible++)
+                return pois[poi].questId;
+        }
+        for (uint32_t i = 0; i < numPois; ++i)
+        {
+            if (!pois[i].visible || finished(pois[i].questId))
+                continue;
+            uint32_t watch = 0;
+            while (watch < NumWatches() && WatchQuest(watch) != pois[i].questId)
+                ++watch;
+            if (watch >= NumWatches() && index == visible++)
+                return pois[i].questId;
+        }
+        return -1;
+    }
+
+    // ---- world checks -----------------------------------------------------------------------------------------------
+
+    // 0x70F580 CGGameObject_C::CanHighlight (thiscall, no argument; __fastcall with an unused edx has the same
+    // contract): an object with a quest (its stats' id for the lock type) is highlighted only while that quest is in
+    // one of the 64 slots. Full eax (mov eax, 1 / xor eax, eax).
+    int __fastcall CanHighlight(const uint8_t* self, void*)
+    {
+        void* typeData = *reinterpret_cast<void* const*>(self + 0x1A0);
+        typedef uint8_t(__thiscall* Usable_t)(void*);   // type data vtable +0x0C, tested as al
+        if (!(*reinterpret_cast<Usable_t const*>(*reinterpret_cast<const uint8_t* const*>(typeData) + 0x0C))(typeData))
+            return 0;
+        const int8_t type = static_cast<int8_t>(*(*reinterpret_cast<const uint8_t* const*>(self + 0xD0) + 0x2D));
+        const uint32_t index = reinterpret_cast<uint32_t(__cdecl*)(int32_t, int32_t)>(0x746190)(type, 0x14);
+        const uint8_t* stats = *reinterpret_cast<const uint8_t* const*>(self + 0x1A4);
+        if (!stats || index >= 0x18)
+            return 1;
+        const int32_t quest = *reinterpret_cast<const int32_t*>(stats + index * 4 + 0x14);
+        if (quest <= 0)
+            return 1;
+        const uint8_t* player = Player();
+        if (!player)
+            return 0;
+        for (uint32_t slot = 0; slot < kMaxSlots; ++slot)
+            if (const uint8_t* e = LogEntry(player, slot))
+                if (static_cast<int32_t>(EntryQuest(e)) == quest)
+                    return 1;
+        return 0;
+    }
+
+    // ---- the refresh after SMSG 0x8F7 -------------------------------------------------------------------------------
+
+    // OnUpdateQuest's (0x6DF370) per-slot half (CoA64 QuestLogSlotUpdated) for a slot of 0..63, with its entry
+    // before the change (`old`, 0x14 bytes). AscQuestLog64::DecideSlot: a quest another slot still holds has moved.
+    void SlotUpdated(uint8_t* player, uint32_t slot, const uint8_t* old)
+    {
+        uint32_t ids[kMaxSlots];
+        for (uint32_t i = 0; i < kMaxSlots; ++i)
+        {
+            const uint8_t* e = LogEntry(player, i);
+            ids[i] = e ? EntryQuest(e) : 0;
+        }
+        const uint8_t* entry = LogEntry(player, slot);
+        if (!entry)
+            return;
+        const uint8_t none[0x14] = {};
+        if (!old)
+            old = none;
+        const AscQuestLog64::SlotDecision decision =
+            AscQuestLog64::DecideSlot(ids, slot, EntryState(entry), EntryQuest(old), EntryState(old));
+        if (decision.accepted)
+        {
+            // 0x6DF2B0 QuestAcceptCallback (runs the same block once the record arrives)
+            if (const uint8_t* q = Quest(static_cast<int32_t>(EntryQuest(entry)), 0x6DF2B0))
+            {
+                typedef void(__cdecl* Error_t)(int, ...);         // CGGameUI::DisplayError 0x5216F0
+                typedef void(__cdecl* Tutorial_t)(int);           // CGTutorial::TriggerTutorial 0x530840
+                typedef uint8_t(__cdecl* Flagged_t)(int);         // IsTutorialFlagged 0x5222B0 (al)
+                typedef void(__cdecl* SignalEvent_t)(int, const char*, ...);   // FrameScript_SignalEvent 0x81B530
+                reinterpret_cast<Error_t>(0x5216F0)(0x92, q + kQName);   // ERR_QUEST_ACCEPTED_S
+                if (Q<int32_t>(q, 0x14) == 1)
+                {
+                    reinterpret_cast<Tutorial_t>(0x530840)(0x28);
+                    reinterpret_cast<Tutorial_t>(0x530840)(0x26);
+                }
+                uint32_t& accepted = *reinterpret_cast<uint32_t*>(0xC9EB08);   // s_questsAccepted
+                if (!reinterpret_cast<Flagged_t>(0x5222B0)(0x14) && ++accepted >= 4)
+                    reinterpret_cast<Tutorial_t>(0x530840)(0x14);
+                reinterpret_cast<SignalEvent_t>(0x81B530)(0x270, "%d", GetQuestIndex(Q<int32_t>(q, 0)));   // QUEST_ACCEPTED
+            }
+        }
+        if (const uint8_t* q = Quest(static_cast<int32_t>(EntryQuest(LogEntry(player, slot)))))
+        {
+            const int32_t index = GetQuestIndex(Q<int32_t>(q, 0)) - 1;
+            if (index >= 0 && (Q<uint32_t>(q, kQFlags) & 0x10000) && IsQuestCompleteEx(static_cast<uint32_t>(index), 1))
+            {
+                uint32_t guid[2];   // the player's own guid (descriptor +0)
+                memcpy(guid, *reinterpret_cast<const uint8_t* const*>(player + 8), 8);
+                // CGPlayer_C::CompleteQuest 0x6D4D40 (__thiscall(player, guid*, quest id), ret 8: 0x6DF370 sets
+                // ecx = the player, mov ecx, ebx). Its body ignores ecx; the player is passed for any detour of it.
+                reinterpret_cast<void(__thiscall*)(void*, const uint32_t*, int32_t)>(0x6D4D40)(player, guid, Q<int32_t>(q, 0));
+            }
+        }
+        if (decision.removePoi)
+            reinterpret_cast<void(__cdecl*)(uint32_t)>(0x5DEC10)(EntryQuest(old));   // RemoveQuestPointDisplay
+    }
+
+    // 0x6DF370 OnUpdateQuest, the mirror handler of descriptor slots 0..24 (cdecl: guid, field offset, count, the
+    // entry before the change, param; returns 1). Ported so a promotion into a native slot is a move here too.
+    int __cdecl OnUpdateQuest(uint32_t guidLo, uint32_t guidHi, uint32_t offset, uint32_t, const uint8_t* old, void*)
+    {
+        uint8_t* player = reinterpret_cast<uint8_t*(__cdecl*)(uint32_t, uint32_t, uint32_t, const char*, int)>(0x4D4DB0)(
+            guidLo, guidHi, kTypePlayer, kFile, 0);   // ClntObjMgrObjectPtr
+        if (!player)
+            return 1;
+        const uint64_t active = reinterpret_cast<uint64_t(__cdecl*)()>(0x4D3790)();   // ClntObjMgrGetActivePlayer
+        const uint32_t* guid = *reinterpret_cast<const uint32_t* const*>(player + 8);
+        if (guid[0] == static_cast<uint32_t>(active) && guid[1] == static_cast<uint32_t>(active >> 32))
+            QueryQuestGiverStatus();
+        Update(1);
+        SlotUpdated(player, (offset - 0x28) / 0x14, old);
+        return 1;
+    }
+
+    // After every applied 0x8F7 (CoA64 QuestLogExtendedClient Refresh): what OnUpdateQuest runs once for the packet
+    // (quest-giver status, CGQuestLog::Update(1): rebuild, re-sort, POI query, QUEST_LOG_UPDATE), then its per-slot
+    // half for each changed slot. Changes() is empty for the first packet after a clear, so a login shows no
+    // "Quest accepted". QUEST_LOG_UPDATE is sent once: by Update(1), or here when Update(1) returns before its signal
+    // because quest records are still being fetched (s_questCallbackCount).
+    void Refresh()
+    {
+        uint8_t* player = Player();
+        if (!player)
+            return;
+        QueryQuestGiverStatus();
+        const bool pending = CallbackCount() != 0;
+        Update(1);
+        if (pending)
+            Signal(kQuestLogUpdate);
+        // World entry's LoadTrackedQuests ran before slots 25..63 arrived, so their saved watches were refused. Load
+        // them again (AddQuestWatch skips duplicates), or let Update(1) do it once the pending quest records arrive.
+        if (AscQuestLog64::FirstSinceClear())
+        {
+            if (CallbackCount())
+                TrackedLoaded() = 0;
+            else
+                reinterpret_cast<int(__cdecl*)()>(0x5E65B0)();   // CGQuestLog::LoadTrackedQuests
+        }
+        for (const AscQuestLog64::Change& c : AscQuestLog64::Changes())
+        {
+            uint8_t old[0x14];
+            memcpy(old, &c.old.questId, 4);
+            memcpy(old + 4, &c.old.state, 4);
+            memcpy(old + 8, c.old.counters, 8);
+            memcpy(old + 16, &c.old.time, 4);
+            SlotUpdated(player, c.slot, old);
+        }
+    }
+
+    // ---- operand patches: client functions that only index the list ------------------------------------------
+    //
+    // Instead of a port, every operand that addresses the old list is pointed at the DLL list: m_quests row
+    // fields (0xC237B0 + 0/4/8/0xC) -> s_list.rows + the same offset, the count 0xC23AD0 -> s_list.count, and each
+    // `cmp eax, 32h` (50 rows) bounding a row walk -> `cmp al, 80h` (128 rows; 128 does not fit a signed imm8, and
+    // every such site counts eax up from 0 by 1 and branches with jb, so the 8-bit unsigned compare is exact). The
+    // selection globals (0xC23AD8, 0xC23ADC) are not relocated. Each function's patches are applied only when every
+    // original operand matches; otherwise the function is left alone (it then reads the mirror) and the log says so.
+    // Table generated from IDA (2026-11-25); docs/QUEST_LOG_64.md lists every site.
+    //
+    // The watch array moves the same way: every operand 0xC23680 + k (m_questWatches, 12-byte entries; k from
+    // -12) -> s_watches + k, and each `cmp r, 19h` bounding a watch index -> `cmp r, 40h` (64). The count 0xC23AE0
+    // stays where it is. The watch functions are one group, patched all or nothing (PatchOperands), so the array
+    // never lives in two places.
+    //
+    // The POI array moves the same way, as a second group: every operand 0xC23B00 + k (m_questPOIs, 0x30-byte
+    // entries) -> s_pois + k, each 4-byte bound 4B0h (25 entries in bytes) -> C00h and each count 19h -> 40h (kPoiImm),
+    // and each `cmp eax, 19h` POI index bound -> `cmp eax, 40h` (kPoiBound). GetQuestWorldMapAreaID's list walk is
+    // in the group too, since the function holds POI operands. UpdatePOIIcons and GetPOIQuestIDByVisibleIndex are
+    // ported and read whichever array is in use. The client's static constructor (0x9CB280) and atexit destructor
+    // (0x9D64D0) of m_questPOIs keep working on the old, then unused, array.
+    //
+    // World checks: CheckForQuestItemLoot's descriptor walk bound 21Ch -> 528h (kSlotBytes; its slot read is a slot site).
+    enum OperandKind : uint8_t { kRows, kCount, kBound, kWatches, kWatchBound, kPois, kPoiImm, kPoiBound, kSlotBytes };
+    struct OperandPatch
+    {
+        uint32_t function;
+        uint32_t at;         // the operand's 4 bytes (kRows, kCount, kWatches, kPois, kPoiImm, kSlotBytes); the instruction (bounds)
+        uint32_t original;   // the operand's value; for a bound, the instruction's 3 bytes little-endian
+        OperandKind kind;
+    };
+    const OperandPatch kOperandPatches[] = {
+        {0x5E1460, 0x5E150E, 0xC237B4, kRows},    // GetQuestLeaderBoardByID: mov edi, m_quests[].logSlot
+        {0x5E1460, 0x5E1A3B, 0xC237B0, kRows},    //   mov ecx, offset m_quests
+        {0x5E1460, 0x5E1A54, 0x32F883, kBound},   //   cmp eax, 32h
+        {0x5E1460, 0x5E1F37, 0xC237B0, kRows},    //   mov ecx, offset m_quests
+        {0x5E1460, 0x5E1F54, 0x32F883, kBound},   //   cmp eax, 32h
+        {0x5E20A0, 0x5E2147, 0xC237B4, kRows},    // GetQuestLogItemDropByID: mov esi, m_quests[].logSlot
+        {0x5E2370, 0x5E2401, 0xC23AD0, kCount},   // GetQuestLeaderBoardForObject
+        {0x5E2370, 0x5E240C, 0xC237B8, kRows},
+        {0x5E2370, 0x5E2415, 0xC237B4, kRows},
+        {0x5E2630, 0x5E26C1, 0xC23AD0, kCount},   // GetQuestLeaderBoardForItem
+        {0x5E2630, 0x5E26CC, 0xC237B8, kRows},
+        {0x5E2630, 0x5E26D5, 0xC237B4, kRows},
+        {0x5E1300, 0x5E1423, 0xC237B0, kRows},    // GetNumQuestLeaderBoards: mov ecx, offset m_quests
+        {0x5E1300, 0x5E1439, 0x32F883, kBound},   //   cmp eax, 32h
+        {0x5E0DA0, 0x5E0DAB, 0xC23AD0, kCount},   // GetQuestSpecialItem
+        {0x5E0DA0, 0x5E0DBD, 0xC237B8, kRows},
+        {0x5E0DA0, 0x5E0DC9, 0xC237B0, kRows},
+        {0x5E1250, 0x5E125E, 0xC23AD0, kCount},   // UpdateQuestItem
+        {0x5E1250, 0x5E126A, 0xC237B0, kRows},
+        {0x5E1250, 0x5E12AF, 0xC23AD0, kCount},
+        {0x5DF460, 0x5DF4A6, 0xC23AD0, kCount},   // Script_GetQuestLogRequiredMoney
+        {0x5DF460, 0x5DF4B1, 0xC237B8, kRows},
+        {0x5DF460, 0x5DF4BA, 0xC237B0, kRows},
+        {0x5DF520, 0x5DF55B, 0xC23AD0, kCount},   // Script_GetQuestLogPushable
+        {0x5DF520, 0x5DF566, 0xC237B8, kRows},
+        {0x5DF520, 0x5DF56F, 0xC237B0, kRows},
+        {0x5E06D0, 0x5E0719, 0xC23AD0, kCount},   // Script_GetQuestLogCompletionText
+        {0x5E06D0, 0x5E0724, 0xC237B8, kRows},
+        {0x5E06D0, 0x5E072D, 0xC237B0, kRows},
+        {0x5E3D60, 0x5E3EF4, 0xC23AD0, kCount},   // Script_GetAbandonQuestItems
+        {0x5E3D60, 0x5E3F09, 0xC237B0, kRows},
+        {0x5E3D60, 0x5E3FAD, 0xC23AD0, kCount},
+        {0x5E41A0, 0x5E420C, 0xC23AD0, kCount},   // Script_GetNumQuestLeaderBoards
+        {0x5E41A0, 0x5E4217, 0xC237B8, kRows},
+        {0x5E41A0, 0x5E4220, 0xC237B0, kRows},
+        {0x5E4260, 0x5E42CC, 0xC23AD0, kCount},   // Script_GetNumQuestItemDrops
+        {0x5E4260, 0x5E42D7, 0xC237B8, kRows},
+        {0x5E4260, 0x5E42E0, 0xC237B0, kRows},
+        {0x5E4ED0, 0x5E4F0C, 0xC23AD0, kCount},   // Script_QuestLogPushQuest
+        {0x5E4ED0, 0x5E4F17, 0xC237B8, kRows},
+        {0x5E4ED0, 0x5E4F20, 0xC237B0, kRows},
+        {0x5E51D0, 0x5E521B, 0xC23AD0, kCount},   // Script_GetQuestLink
+        {0x5E51D0, 0x5E522C, 0xC237B8, kRows},
+        {0x5E51D0, 0x5E5234, 0xC237B0, kRows},
+        {0x5E5F60, 0x5E602E, 0xC23AD0, kCount},   // Script_GetQuestLogLeaderBoard
+        {0x5E5F60, 0x5E6039, 0xC237B8, kRows},
+        {0x5E5F60, 0x5E6041, 0xC237B0, kRows},
+        {0x5E60D0, 0x5E619E, 0xC23AD0, kCount},   // Script_GetQuestLogItemDrop
+        {0x5E60D0, 0x5E61A9, 0xC237B8, kRows},
+        {0x5E60D0, 0x5E61B1, 0xC237B0, kRows},
+        {0x621070, 0x621EF9, 0xC23AD0, kCount},   // CGTooltip::SetUnit (then GetQuestAt, ported)
+        {0x621070, 0x6221FC, 0xC23AD0, kCount},
+        {0x626720, 0x626AD2, 0xC23AD0, kCount},   // CGTooltip::SetObject (then GetQuestAt, ported)
+        {0x626720, 0x626D43, 0xC23AD0, kCount},
+        {0x5E2950, 0x5E2963, 0xC237B0, kRows},    // ComputeBlobQuestObjectives: mov ecx, offset m_quests
+        {0x5E2950, 0x5E2976, 0x32F883, kBound},   //   cmp eax, 32h
+        {0x5E2950, 0x5E2982, 0xC23AD0, kCount},
+        {0x5E2950, 0x5E2992, 0xC237B8, kRows},
+        {0x5E2950, 0x5E29CD, 0xC237B4, kRows},    //   then GetQuestLogEntry (0x5E0870, replaced)
+        {0x5E2950, 0x5E29E5, 0xC237B0, kRows},
+
+        // ---- the watch group ----
+        {0x5DEA60, 0x5DEA74, 0xC23680, kWatches},      // RemoveQuestWatch (AscAttachLate detours its first 10 bytes)
+        {0x5DEA60, 0x5DEA99, 0xC23680, kWatches},      //   lea eax, m_questWatches[eax*4]
+        {0x5DEA60, 0x5DEABC, 0xC23674, kWatches},      //   mov m_questWatches[count-1].questId, 0
+        {0x5DEA60, 0x5DEACC, 0xC23678, kWatches},      //   mov m_questWatches[count-1].expireTime, 0
+        {0x5DEF60, 0x5DEF9A, 0xC23680, kWatches},      // ShiftQuestWatches (indices checked against the count)
+        {0x5DEF60, 0x5DEFA1, 0xC23680, kWatches},
+        {0x5DEF60, 0x5DEFCB, 0xC23680, kWatches},
+        {0x5DEF60, 0x5DEFF7, 0xC23680, kWatches},
+        {0x5DF610, 0x5DF66F, 0xC23AD0, kCount},        // Script_IsQuestWatched
+        {0x5DF610, 0x5DF67A, 0xC237B8, kRows},
+        {0x5DF610, 0x5DF683, 0xC237B0, kRows},
+        {0x5DF610, 0x5DF698, 0xC23680, kWatches},
+        {0x5DF610, 0x5DF6A0, 0x19F883, kWatchBound},   //   i < 25 ? watch : 0
+        {0x5DF700, 0x5DF746, 0xC23AD0, kCount},        // Script_RemoveQuestWatch (then RemoveQuestWatch)
+        {0x5DF700, 0x5DF751, 0xC237B8, kRows},
+        {0x5DF700, 0x5DF75A, 0xC237B0, kRows},
+        {0x5DF780, 0x5DF7D6, 0x19F883, kWatchBound},   // Script_GetQuestIndexForWatch: watch < 25
+        {0x5DF780, 0x5DF7E4, 0xC23680, kWatches},
+        {0x5DF780, 0x5DF7EE, 0xC23AD0, kCount},
+        {0x5DF780, 0x5DF7F9, 0xC237B0, kRows},
+        {0x5DFC40, 0x5DFC9D, 0xC23AD0, kCount},        // Script_GetQuestWatchIndex
+        {0x5DFC40, 0x5DFCA8, 0xC237B8, kRows},
+        {0x5DFC40, 0x5DFCB1, 0xC237B0, kRows},
+        {0x5DFC40, 0x5DFCC6, 0xC23680, kWatches},
+        {0x5DFC40, 0x5DFCD0, 0x19F883, kWatchBound},   //   i < 25 ? watch : 0
+        {0x5DFEF0, 0x5DFEFD, 0xC23684, kWatches},      // UpdateWatchTimers: mov esi, offset m_questWatches[0].expireTime
+        {0x5E0240, 0x5E0276, 0xC23680, kWatches},      // SaveTrackedQuests
+        {0x5E5C10, 0x5E5C48, 0xC23688, kWatches},      // SortQuestWatches: m_questWatches[0].distance
+        {0x5E5C10, 0x5E5C9C, 0xC23680, kWatches},      //   qsort base
+        {0x5E64D0, 0x5E64E4, 0xC237B0, kRows},         // AddQuestWatch: the quest's row, 50 -> 128 rows
+        {0x5E64D0, 0x5E64F8, 0x32F983, kBound},        //   cmp ecx, 32h -> cmp cl, 80h
+        {0x5E64D0, 0x5E6513, 0xC23680, kWatches},
+        {0x5E64D0, 0x5E6525, 0x19FA83, kWatchBound},   //   full at 25 -> 64 watches
+        {0x5E64D0, 0x5E6538, 0xC23680, kWatches},
+        {0x5E64D0, 0x5E6546, 0xC23684, kWatches},
+        {0x5E64D0, 0x5E655D, 0xC23684, kWatches},
+        {0x5E64D0, 0x5E6570, 0xC23684, kWatches},
+        {0x5E64D0, 0x5E657C, 0xC23684, kWatches},
+        {0x5E64D0, 0x5E658D, 0xC23684, kWatches},
+        {0x5E67C0, 0x5E6807, 0xC23AD0, kCount},        // Script_AddQuestWatch (then AddQuestWatch)
+        {0x5E67C0, 0x5E6812, 0xC237B8, kRows},
+        {0x5E67C0, 0x5E681B, 0xC237B0, kRows},
+        // (0x5E3840 GetPOIQuestIDByVisibleIndex, which also walks the watches, is ported with the POIs.)
+
+        // ---- list-only, POI functions ----
+        {0x5E6650, 0x5E671B, 0xC23AD0, kCount},        // Script_GetQuestPOILeaderBoard (then 0x5E58C0)
+        {0x5E6650, 0x5E6726, 0xC237B8, kRows},
+        {0x5E6650, 0x5E672E, 0xC237B0, kRows},
+
+        // ---- the POI group ----
+        {0x5DEEE0, 0x5DEEF2, 0xC23B00, kPois},         // GetQuestPOIIcon (also called by AscSuperTrack)
+        {0x5DEEE0, 0x5DEEFF, 0x0004B0, kPoiImm},       //   cmp eax, 4B0h
+        {0x5DEEE0, 0x5DEF14, 0xC23B2C, kPois},
+        {0x5DEEE0, 0x5DEF20, 0xC23B14, kPois},
+        {0x5DEEE0, 0x5DEF2B, 0xC23B1C, kPois},
+        {0x5DEEE0, 0x5DEF36, 0xC23B20, kPois},
+        {0x5DEEE0, 0x5DEF41, 0xC23B24, kPois},
+        {0x5DEEE0, 0x5DEF4C, 0xC23B18, kPois},
+        {0x5DFA80, 0x5DFAC1, 0x19F883, kPoiBound},     // Script_QuestPOIGetQuestIDByIndex: index < 25 (jnb)
+        {0x5DFA80, 0x5DFACE, 0xC23B00, kPois},
+        {0x5E28B0, 0x5E28E2, 0xC23B00, kPois},         // HasQuestPOI
+        {0x5E28B0, 0x5E28EC, 0x0004B0, kPoiImm},
+        {0x5E2900, 0x5E2932, 0xC23B00, kPois},         // GetQuestPOIIndex
+        {0x5E2900, 0x5E2940, 0x0004B0, kPoiImm},
+        {0x5E2B60, 0x5E2C1A, 0xC23B00, kPois},         // GetQuestWorldMapAreaID: the POI search
+        {0x5E2B60, 0x5E2C27, 0x0004B0, kPoiImm},
+        {0x5E2B60, 0x5E2C3A, 0xC23B00, kPois},
+        {0x5E2B60, 0x5E2C52, 0xC23B08, kPois},
+        {0x5E2B60, 0x5E2C58, 0xC23B2C, kPois},
+        {0x5E2B60, 0x5E2C82, 0xC23B2C, kPois},
+        {0x5E2B60, 0x5E2C8D, 0xC23B0C, kPois},
+        {0x5E2B60, 0x5E2CA1, 0xC23B0C, kPois},
+        {0x5E2B60, 0x5E2D25, 0xC23B0C, kPois},
+        {0x5E2B60, 0x5E2D9C, 0xC23B08, kPois},
+        {0x5E2B60, 0x5E2DC9, 0xC23B0C, kPois},
+        {0x5E2B60, 0x5E2DDB, 0xC23B0C, kPois},
+        {0x5E2B60, 0x5E2DF2, 0xC237B0, kRows},         //   and its header walk over the list: mov ecx, offset m_quests
+        {0x5E2B60, 0x5E2E09, 0x32F883, kBound},        //   cmp eax, 32h (eax from 0 by 1, jb)
+        {0x5E2B60, 0x5E2E1C, 0xC237B0, kRows},         //   mov ecx, m_quests[header]
+        {0x5E3AC0, 0x5E3AD3, 0x19F883, kPoiBound},     // GetQuestPOIInfo: index < 25 (jnb)
+        {0x5E3AC0, 0x5E3ADF, 0xC23B00, kPois},
+        {0x5E3B90, 0x5E3C39, 0xC23B00, kPois},         // GetQuestPOIDistance (index from GetQuestPOIIndex)
+        {0x5E3B90, 0x5E3C48, 0xC23B08, kPois},
+        {0x5E3B90, 0x5E3C4E, 0xC23B2C, kPois},
+        {0x5E3B90, 0x5E3C62, 0xC23B2C, kPois},
+        {0x5E3B90, 0x5E3C6D, 0xC23B0C, kPois},
+        {0x5E3B90, 0x5E3C81, 0xC23B0C, kPois},
+        {0x5E3B90, 0x5E3CE1, 0xC23B0C, kPois},
+        {0x5E3B90, 0x5E3D3A, 0xC23B08, kPois},
+        {0x5E5A50, 0x5E5B16, 0xC23B00, kPois},         // UpdateAllQuestPOI
+        {0x5E5A50, 0x5E5B25, 0xC23B08, kPois},
+        {0x5E5A50, 0x5E5B2B, 0xC23B2C, kPois},
+        {0x5E5A50, 0x5E5B31, 0xC23B28, kPois},
+        {0x5E5A50, 0x5E5B42, 0xC23B2C, kPois},
+        {0x5E5A50, 0x5E5B4D, 0xC23B0C, kPois},
+        {0x5E5A50, 0x5E5B60, 0xC23B0C, kPois},
+        {0x5E5A50, 0x5E5BD1, 0xC23B08, kPois},
+        {0x5E5A50, 0x5E5BE6, 0xC23B28, kPois},
+        {0x5E5A50, 0x5E5BF0, 0x0004B0, kPoiImm},
+        {0x5E6F30, 0x5E6F41, 0xC23B0C, kPois},         // ShutdownGame: frees the blobs
+        {0x5E6F30, 0x5E6F46, 0x000019, kPoiImm},       //   mov ebx, 19h (count down)
+        {0x5E7020, 0x5E7062, 0xC23B00, kPois},         // FindOrFreePOISlot
+        {0x5E7020, 0x5E707F, 0x0004B0, kPoiImm},
+        {0x5E7020, 0x5E7097, 0xC23B04, kPois},
+        {0x5E7020, 0x5E70A1, 0xC23B00, kPois},
+        {0x5E70D0, 0x5E70DA, 0xC23B0C, kPois},         // UpdateQuestPOIFromUserServer
+        {0x5E70D0, 0x5E70E1, 0x000019, kPoiImm},       //   mov [ebp-0Ch], 19h (count down)
+        {0x5E71A0, 0x5E7202, 0xC23B00, kPois},         // InitializeGame (detoured at its first 5 bytes): POI fields
+        {0x5E71A0, 0x5E7208, 0xC23B14, kPois},
+        {0x5E71A0, 0x5E720E, 0xC23B18, kPois},
+        {0x5E71A0, 0x5E7214, 0xC23B1C, kPois},
+        {0x5E71A0, 0x5E721A, 0xC23B20, kPois},
+        {0x5E71A0, 0x5E7220, 0xC23B24, kPois},
+        {0x5E71A0, 0x5E7226, 0xC23B29, kPois},
+        {0x5E71A0, 0x5E722C, 0xC23B28, kPois},
+        {0x5E71A0, 0x5E7232, 0xC23B2C, kPois},
+        {0x5E71A0, 0x5E723A, 0x0004B0, kPoiImm},
+        {0x5E7370, 0x5E73E2, 0xC23B00, kPois},         // HandlePOIQueryResponse: known?
+        {0x5E7370, 0x5E73F0, 0x0004B0, kPoiImm},
+        {0x5E7370, 0x5E7412, 0x19F883, kPoiBound},     //   slot from FindOrFreePOISlot < 25 (jnb)
+        {0x5E7370, 0x5E7425, 0xC23B00, kPois},
+        {0x6D7DE0, 0x6D7EE3, 0x00021C, kSlotBytes},    // CGPlayer_C::CheckForQuestItemLoot: cmp edi, 21Ch (slot walk)
+    };
+
+    bool IsWatchPatch(const OperandPatch& p) { return p.kind == kWatches || p.kind == kWatchBound; }
+    bool IsPoiPatch(const OperandPatch& p) { return p.kind == kPois || p.kind == kPoiImm || p.kind == kPoiBound; }
+
+    // The quest log entry the four leaderboard functions below read, for any slot (they keep their slot < 0 test).
+    const uint8_t* __cdecl SiteSlotEntry(const uint8_t* player, uint32_t slot)
+    {
+        return player && slot < kMaxSlots ? LogEntry(player, slot) : nullptr;
+    }
+
+    // ---- slot sites: the descriptor read inside the leaderboard functions ---------------------------------------
+    //
+    // GetQuestLeaderBoardByID, GetQuestLogItemDropByID, GetQuestLeaderBoardForObject and GetQuestLeaderBoardForItem
+    // each compute their log entry in one block:
+    //     cmp slot, 19h / ja null / mov r, player / mov r, [r+1008h] / lea / lea dest, [...] / jmp done / null: xor dest
+    // That block (from the cmp up to the null label, 23 bytes, no jump into it) becomes
+    //     push slot / push [ebp+player] / call SiteSlotEntry / add esp, 8 / mov dest, eax / jmp done / nops
+    // which clobbers eax, ecx and edx as the original block does. The rest of each function (3 KB for
+    // GetQuestLeaderBoardByID, with AscAttachLate's byte patches) runs unchanged.
+    //
+    // World checks: CheckForQuestItemLoot (0x6D7DE0) reads its entry in a 20-byte block,
+    //     cmp eax, 19h / ja next / mov eax, [ebp-0Ch] (player) / mov esi, [eax+1008h] / add esi, edi
+    // which becomes the same call (dest esi) and a jmp to the block's end, where the original tests esi for null.
+    // Its `jl` before the block stays; its walk bound is a kSlotBytes operand patch.
+    struct SlotSite
+    {
+        uint32_t function, start, nullLabel, done;   // nullLabel: the first byte after the replaced block
+        X86Reg slot, dest;
+        int8_t player;          // [ebp + player]
+        uint8_t size;           // bytes replaced (start .. nullLabel)
+        uint8_t original[23];
+    };
+    const SlotSite kSlotSites[] = {
+        {0x5E1460, 0x5E1553, 0x5E156A, 0x5E156C, kEdi, kEdi, -4, 23,
+         {0x83, 0xFF, 0x19, 0x77, 0x12, 0x8B, 0x55, 0xFC, 0x8B, 0x82, 0x08, 0x10, 0x00, 0x00, 0x8D, 0x4C, 0xBF, 0x0A,
+          0x8D, 0x3C, 0x88, 0xEB, 0x02}},
+        {0x5E20A0, 0x5E218C, 0x5E21A3, 0x5E21A5, kEsi, kEax, 0x0C, 23,
+         {0x83, 0xFE, 0x19, 0x77, 0x12, 0x8B, 0x4D, 0x0C, 0x8B, 0x91, 0x08, 0x10, 0x00, 0x00, 0x8D, 0x44, 0xB6, 0x0A,
+          0x8D, 0x04, 0x82, 0xEB, 0x02}},
+        {0x5E2370, 0x5E241D, 0x5E2434, 0x5E2436, kEax, kEcx, 0x10, 23,
+         {0x83, 0xF8, 0x19, 0x77, 0x12, 0x8B, 0x4D, 0x10, 0x8B, 0x91, 0x08, 0x10, 0x00, 0x00, 0x8D, 0x44, 0x80, 0x0A,
+          0x8D, 0x0C, 0x82, 0xEB, 0x02}},
+        {0x5E2630, 0x5E26DD, 0x5E26F4, 0x5E26F6, kEax, kEax, 0x10, 23,
+         {0x83, 0xF8, 0x19, 0x77, 0x12, 0x8B, 0x4D, 0x10, 0x8B, 0x91, 0x08, 0x10, 0x00, 0x00, 0x8D, 0x44, 0x80, 0x0A,
+          0x8D, 0x04, 0x82, 0xEB, 0x02}},
+        {0x6D7DE0, 0x6D7E20, 0x6D7E34, 0x6D7E34, kEax, kEsi, -0x0C, 20,
+         {0x83, 0xF8, 0x19, 0x0F, 0x87, 0xAF, 0x00, 0x00, 0x00, 0x8B, 0x45, 0xF4, 0x8B, 0xB0, 0x08, 0x10, 0x00, 0x00,
+          0x03, 0xF7}},
+    };
+
+    // ---- Packet_Group_17's slot walk --------------------------------------------------------------------------------
+    //
+    // Packet_Group_17 (0x6D8030, SMSG_QUESTUPDATE_*) looks the quest up in the 25 descriptor slots, in 60 bytes from
+    // 0x6D807A (mov edi, [ebp-4]) to 0x6D80B6: edi = the quest id, ebx = 1 when its first slot is failed. That block
+    // becomes FailedSiteCode calling QuestFailedInLog, over 64 slots. No jump from outside lands inside it, and
+    // eax / ecx / edx / esi are set again after it (0x6D80B9 onward) before they are read.
+    const uint8_t kFailedSiteOriginal[] = {
+        0x8B, 0x7D, 0xFC, 0x33, 0xF6, 0x8D, 0x53, 0x28, 0x85, 0xF6, 0x7C, 0x13, 0x83, 0xFE, 0x19, 0x77, 0x0E, 0x8B, 0x88,
+        0x08, 0x10, 0x00, 0x00, 0x03, 0xCA, 0x74, 0x04, 0x39, 0x39, 0x74, 0x10, 0x83, 0xC2, 0x14, 0x83, 0xC6, 0x01, 0x81,
+        0xFA, 0x1C, 0x02, 0x00, 0x00, 0x72, 0xDB, 0xEB, 0x10, 0xF6, 0x41, 0x04, 0x02, 0x74, 0x0A, 0xBB, 0x01, 0x00, 0x00,
+        0x00, 0xEB, 0x03};
+    constexpr uint32_t kFailedSite = 0x6D807A, kFailedSiteDone = 0x6D80B9;
+    static_assert(sizeof(kFailedSiteOriginal) == 0x6D80B6 - 0x6D807A, "Packet_Group_17 slot walk");
+
+    // The active player's first slot (0..63) holding `questId`: 1 when it is failed (state bit 1), else 0 (also when
+    // the quest is not logged). Full eax: the site moves it to ebx, which the function tests as a whole.
+    int __cdecl QuestFailedInLog(uint32_t questId)
+    {
+        const uint8_t* player = Player();
+        if (!player)
+            return 0;
+        for (uint32_t slot = 0; slot < kMaxSlots; ++slot)
+            if (const uint8_t* e = LogEntry(player, slot))
+                if (EntryQuest(e) == questId)
+                    return (EntryState(e) & 2) ? 1 : 0;
+        return 0;
+    }
+
+    void WriteCode(uint32_t at, const void* bytes, uint32_t size)
+    {
+        DWORD old;
+        if (!VirtualProtect(reinterpret_cast<void*>(at), size, PAGE_EXECUTE_READWRITE, &old))
+            return;
+        memcpy(reinterpret_cast<void*>(at), bytes, size);
+        VirtualProtect(reinterpret_cast<void*>(at), size, old, &old);
+        FlushInstructionCache(GetCurrentProcess(), reinterpret_cast<void*>(at), size);
+    }
+
+    bool IsBound(const OperandPatch& p) { return p.kind == kBound || p.kind == kWatchBound || p.kind == kPoiBound; }
+    // A POI index bound `cmp r32, 19h` takes the same 25 -> 64 rewrite as a watch bound.
+    uint32_t BoundPatched(const OperandPatch& p) { return p.kind == kBound ? RowBound(p.original) : WatchBound(p.original); }
+
+    bool OperandMatches(const OperandPatch& p)
+    {
+        if (IsBound(p))
+            return BoundPatched(p) != 0 && memcmp(reinterpret_cast<const void*>(p.at), &p.original, 3) == 0;
+        if ((p.kind == kPoiImm && !PoiImm(p.original)) || (p.kind == kSlotBytes && !SlotBytesBound(p.original)))
+            return false;
+        return memcmp(reinterpret_cast<const void*>(p.at), &p.original, 4) == 0;
+    }
+
+    void ApplyOperand(const OperandPatch& p)
+    {
+        if (IsBound(p))
+        {
+            const uint32_t bytes = BoundPatched(p);
+            return WriteCode(p.at, &bytes, 3);
+        }
+        uint32_t value;
+        switch (p.kind)
+        {
+        case kWatches: value = RelocatedWatch(p.original, reinterpret_cast<uint32_t>(s_watches)); break;
+        case kPois: value = RelocatedPoi(p.original, reinterpret_cast<uint32_t>(s_pois)); break;
+        case kPoiImm: value = PoiImm(p.original); break;
+        case kSlotBytes: value = SlotBytesBound(p.original); break;
+        default:
+            value = Relocated(p.original, reinterpret_cast<uint32_t>(s_list.rows), reinterpret_cast<uint32_t>(&s_list.count));
+            break;
+        }
+        WriteCode(p.at, &value, 4);
+    }
+
+    void ApplySlotSite(const SlotSite& s)
+    {
+        uint8_t code[sizeof(s.original)];
+        SlotSiteCode(code, s.size, s.start, s.done, s.slot, s.dest, s.player, reinterpret_cast<uint32_t>(&SiteSlotEntry));
+        WriteCode(s.start, code, s.size);
+    }
+
+    // Whether one function's operand patches and slot site all match the client (each mismatch is logged).
+    bool FunctionMatches(uint32_t function)
+    {
+        bool ok = true;
+        for (const OperandPatch& p : kOperandPatches)
+            if (p.function == function && !OperandMatches(p))
+            {
+                AscLog::Printf("AscQuestLog64List: 0x%06X operand at 0x%06X does not match", function, p.at);
+                ok = false;
+            }
+        for (const SlotSite& s : kSlotSites)
+            if (s.function == function && (memcmp(reinterpret_cast<const void*>(s.start), s.original, s.size) != 0 ||
+                                           s.start + s.size != s.nullLabel))
+            {
+                AscLog::Printf("AscQuestLog64List: 0x%06X slot site at 0x%06X does not match", function, s.start);
+                ok = false;
+            }
+        return ok;
+    }
+
+    void ApplyFunction(uint32_t function)
+    {
+        for (const OperandPatch& p : kOperandPatches)
+            if (p.function == function)
+                ApplyOperand(p);
+        for (const SlotSite& s : kSlotSites)
+            if (s.function == function)
+                ApplySlotSite(s);
+    }
+
+    enum Group : uint8_t { kOwn, kWatchGroup, kPoiGroup };   // kOwn: each function on its own
+    Group GroupOf(uint32_t function)
+    {
+        for (const OperandPatch& p : kOperandPatches)
+            if (p.function == function && (IsWatchPatch(p) || IsPoiPatch(p)))
+                return IsWatchPatch(p) ? kWatchGroup : kPoiGroup;
+        return kOwn;
+    }
+    bool InWatchGroup(uint32_t function) { return GroupOf(function) == kWatchGroup; }
+
+    // The distinct functions of `group`, in table order (the table has 24 on their own, 9 watch and 13 POI
+    // functions); `max` is checked so a longer table fails loudly instead of skipping functions.
+    uint32_t Functions(uint32_t* out, uint32_t max, Group group)
+    {
+        uint32_t count = 0;
+        for (const OperandPatch& p : kOperandPatches)
+        {
+            bool seen = false;
+            for (uint32_t i = 0; i < count; ++i)
+                seen |= out[i] == p.function;
+            if (seen || GroupOf(p.function) != group)
+                continue;
+            if (count == max)
+            {
+                AscLog::Printf("AscQuestLog64List: more than %u functions in a patch group", max);
+                return 0;
+            }
+            out[count++] = p.function;
+        }
+        return count;
+    }
+
+    // Applies a group all or nothing; false (nothing written) on any mismatch.
+    bool PatchGroup(Group group, const char* what)
+    {
+        uint32_t functions[64];
+        const uint32_t count = Functions(functions, 64, group);
+        bool ok = count != 0;
+        for (uint32_t i = 0; i < count; ++i)
+            ok &= FunctionMatches(functions[i]);
+        if (!ok)
+        {
+            AscLog::Printf("AscQuestLog64List: the %s functions left unpatched (25 entries)", what);
+            return false;
+        }
+        for (uint32_t i = 0; i < count; ++i)
+            ApplyFunction(functions[i]);
+        return true;
+    }
+
+    bool HasListOperand(uint32_t function)
+    {
+        for (const OperandPatch& p : kOperandPatches)
+            if (p.function == function && (p.kind == kRows || p.kind == kCount || p.kind == kBound))
+                return true;
+        return false;
+    }
+
+    // Each list function on its own, all or nothing; the watch functions as one group, all or nothing, after which
+    // m_questWatches lives in s_watches (64); the POI functions likewise, after which m_questPOIs lives in s_pois
+    // (64). A mismatch anywhere in a group leaves that whole group on the client array (25 entries). A function
+    // still reading m_quests after this (left unpatched) turns the copy-back on (s_mirrorNeeded, Sync).
+    void PatchOperands()
+    {
+        uint32_t functions[64];
+        const uint32_t count = Functions(functions, 64, kOwn);
+        for (uint32_t i = 0; i < count; ++i)
+            if (FunctionMatches(functions[i]))
+                ApplyFunction(functions[i]);
+            else
+            {
+                AscLog::Printf("AscQuestLog64List: 0x%06X left unpatched", functions[i]);
+                s_mirrorNeeded |= HasListOperand(functions[i]);
+            }
+
+        // Packet_Group_17's slot walk (own unit; it reads no list).
+        if (memcmp(reinterpret_cast<const void*>(kFailedSite), kFailedSiteOriginal, sizeof(kFailedSiteOriginal)) == 0)
+        {
+            uint8_t code[sizeof(kFailedSiteOriginal)];
+            FailedSiteCode(code, sizeof(code), kFailedSite, kFailedSiteDone, reinterpret_cast<uint32_t>(&QuestFailedInLog));
+            WriteCode(kFailedSite, code, sizeof(code));
+        }
+        else
+            AscLog::Printf("AscQuestLog64List: 0x6D8030 slot walk at 0x%06X does not match, left unpatched", kFailedSite);
+
+        // Carry over what the client watch array holds (empty at load; the module initialises before the world).
+        const uint32_t live = NumWatches() < AscQuestLog64::kNativeSlots ? NumWatches() : AscQuestLog64::kNativeSlots;
+        Watch carried[AscQuestLog64::kNativeSlots];
+        memcpy(carried, reinterpret_cast<const void*>(0xC23680), live * sizeof(Watch));
+        if (PatchGroup(kWatchGroup, "quest watch"))
+        {
+            memcpy(s_watches, carried, live * sizeof(Watch));
+            s_watchesRelocated = true;
+        }
+        else
+            s_mirrorNeeded = true;   // the watch functions also read m_quests
+        // The POI array is not carried over: it is empty before the world, and its blobs are heap arrays that the
+        // client's destructor would free a second time.
+        s_poisRelocated = PatchGroup(kPoiGroup, "quest POI");
+        s_mirrorNeeded |= !s_poisRelocated;   // GetQuestWorldMapAreaID walks m_quests
+        if (s_mirrorNeeded)
+            AscLog::Printf("AscQuestLog64List: a function still reads m_quests; its first 50 rows are copied back");
+    }
+
+    // ---- MAX_QUESTLOG_QUESTS / MAX_WATCHABLE_QUESTS ------------------------------------------------------------
+
+    // FrameXML sets both to 25 when the interface loads; they follow the server's log size (25 without a packet).
+    void SetInterfaceLimit(lua_State* L)
+    {
+        if (!L)
+            return;
+        lua_pushnumber(L, AscQuestLog64::LogSize());
+        lua_setfield(L, LUA_GLOBALSINDEX, "MAX_QUESTLOG_QUESTS");
+        // AddQuestWatch takes 64 only once the watch array is relocated (PatchOperands); otherwise its 25.
+        lua_pushnumber(L, s_watchesRelocated ? AscQuestLog64::LogSize() : AscQuestLog64::kNativeSlots);
+        lua_setfield(L, LUA_GLOBALSINDEX, "MAX_WATCHABLE_QUESTS");
+    }
+    void ApplyInterfaceLimit() { SetInterfaceLimit(GetState()); }
+
+    constexpr int kPlayerEnteringWorld = 0xFF;   // the client's event table index (0xC24EB0 + 0xFF * 4 = 0xC252AC)
+
+    struct Replacement
+    {
+        uint32_t address;
+        void* fn;
+    };
+
+    void Init()
+    {
+        const Replacement replacements[] = {
+            {0x5E6940, reinterpret_cast<void*>(&Update)},
+            {0x5E0B80, reinterpret_cast<void*>(&FilterAndSortQuests)},
+            {0x5E0C00, reinterpret_cast<void*>(&CollapseHeader)},
+            {0x5DEAE0, reinterpret_cast<void*>(&GetQuestSortId)},
+            {0x5E57E0, reinterpret_cast<void*>(&SetQuestExpired)},
+            {0x5E5840, reinterpret_cast<void*>(&SetQuestExpiredByID)},
+            {0x5DEE30, reinterpret_cast<void*>(&IsQuestFailed)},
+            {0x5DEE60, reinterpret_cast<void*>(&IsQuestExpiredByID)},
+            {0x5E0EA0, reinterpret_cast<void*>(&IsQuestCompleteEx)},
+            {0x5E10B0, reinterpret_cast<void*>(&HasNoObjectives)},
+            {0x5DECC0, reinterpret_cast<void*>(&IsDailyQuest)},
+            {0x5DED30, reinterpret_cast<void*>(&GetQuestSuggestedPlayers)},
+            {0x5E0000, reinterpret_cast<void*>(&GetQuestTitle)},
+            {0x5E0070, reinterpret_cast<void*>(&GetQuestTag)},
+            {0x5DE8C0, reinterpret_cast<void*>(&GetQuestLogSlot)},
+            {0x5DEC40, reinterpret_cast<void*>(&GetQuestAt)},
+            {0x5DEEB0, reinterpret_cast<void*>(&GetQuestIndex)},
+            {0x5DEBD0, reinterpret_cast<void*>(&GetSelectedLogEntry)},
+            {0x5E00E0, reinterpret_cast<void*>(&IsSelectedQuestExpired)},
+            {0x5DFFA0, reinterpret_cast<void*>(&SetSelectedQuest)},
+            {0x5E11D0, reinterpret_cast<void*>(&IsOnQuest)},
+            {0x5E0CC0, reinterpret_cast<void*>(&AbandonSelectedQuest)},
+            {0x5DF010, reinterpret_cast<void*>(&Script_GetNumQuestLogEntries)},
+            {0x5E5CC0, reinterpret_cast<void*>(&Script_GetQuestLogTitle)},
+            {0x5E4320, reinterpret_cast<void*>(&Script_GetQuestLogTimeLeft)},
+            {0x5E43F0, reinterpret_cast<void*>(&Script_IsCurrentQuestFailed)},
+            {0x5E4070, reinterpret_cast<void*>(&Script_IsUnitOnQuest)},
+            {0x5E0870, reinterpret_cast<void*>(&GetQuestLogEntry)},   // also serves 0x5E58C0, 0x5E2950
+            {0x5E6240, reinterpret_cast<void*>(&Script_GetQuestTimers)},
+            {0x5E4FB0, reinterpret_cast<void*>(&Script_GetQuestIndexForTimer)},
+            {0x5E2EB0, reinterpret_cast<void*>(&UpdatePOIIcons)},
+            {0x5E3840, reinterpret_cast<void*>(&GetPOIQuestIDByVisibleIndex)},
+            {0x70F580, reinterpret_cast<void*>(&CanHighlight)},
+            {0x6DF370, reinterpret_cast<void*>(&OnUpdateQuest)},
+        };
+        for (const Replacement& r : replacements)
+            AscRuntime::ReplaceFunction(r.address, r.fn);
+        // push ebp / mov ebp,esp / push ecx / push ebx: five bytes.
+        g_initializeGame = reinterpret_cast<InitializeGame_t>(
+            AscRuntime::Detour(0x5E71A0, 5, reinterpret_cast<void*>(&InitializeGame)));
+        PatchOperands();
+
+        AscRuntime::OnStockEvent(kPlayerEnteringWorld, &SetInterfaceLimit);   // world entry and every /reload
+        AscQuestLog64::OnChanged(&ApplyInterfaceLimit);
+        AscQuestLog64::OnChanged(&Refresh);
+    }
+    AscBindings::Module s_module(nullptr, 0, &Init);
+}
+
+const uint32_t* AscQuestLog64::QuestListRows(uint32_t& count)
+{
+    count = s_list.count;
+    return reinterpret_cast<const uint32_t*>(s_list.rows);
+}
+#endif

@@ -13,7 +13,8 @@
 //   0x401A80 -> sub_10a4bd10   its third argument is always "0"
 //   0x5E0420 / 0x61E5C0 / 0x5E0D20 -> sub_10a44ae0 / sub_10a4d770 / sub_10a790a0
 //                              one of the player's 25 visible item entries (+0x278, stride 0x14) reads
-//                              the player's addon field 0x24+i (0x5E0420) or 0x3D+i (the other two)
+//                              the player's addon field 0x24+i (0x5E0420) or 0x3D+i (the other two);
+//                              with ASCENSION_QUEST_LOG_64 over 64 quest log slots, 25..63 from SMSG 0x8F7
 //   0x755130 -> sub_10a45bd0   the object's unit (if any) gets 0x755E40 first
 //   0x6E4950 -> sub_10a44860   CVar autoRangedCombat "1" -> its int is whether the player has a target
 //                              (+0x598 / +0x59C) before the original
@@ -29,6 +30,7 @@
 //   0x54D010 -> sub_10a79080   replaced: "AllianceFlag" / "HordeFlag"
 #include <Ascension/AscBindings.hpp>
 #include <Ascension/AscObjectAddon.hpp>
+#include <Ascension/AscQuestLog64.hpp>
 #include <Ascension/AscRuntime.hpp>
 #include <Ascension/AscScript.hpp>
 #include <Client/CVar.hpp>
@@ -154,6 +156,17 @@ namespace
         return g_401A80(a, b, reinterpret_cast<uint32_t>("0"), d);
     }
 
+    uint32_t PlayerAddon(uint32_t index) { return AscObjectAddon::Unit(AscScript::ActivePlayerGuid())[index & 0xFFFF].value; }
+
+#if ASCENSION_QUEST_LOG_64
+    // The three below over the 64 quest log slots (CoA64 InitHooks): slots 25..63 from SMSG 0x8F7, whose entry
+    // carries the scaled level and reward XP that addon fields 0x3D+i / 0x24+i hold for 0..24.
+    bool QuestValue(const uint8_t* player, uint32_t entry, uint32_t addonBase, bool level, int32_t& out)
+    {
+        const int32_t slot = AscQuestLog64::QuestSlot(Descriptor(player), entry);
+        return slot >= 0 && AscQuestLog64::SlotValue(static_cast<uint32_t>(slot), addonBase, level, &PlayerAddon, out);
+    }
+#else
     // The player's visible item index whose entry is `entry`, or -1 (sub_10a44ae0 and its two siblings).
     int VisibleItemIndex(const uint8_t* player, uint32_t entry)
     {
@@ -165,39 +178,49 @@ namespace
         }
         return -1;
     }
-    uint32_t PlayerAddon(uint32_t index) { return AscObjectAddon::Unit(AscScript::ActivePlayerGuid())[index & 0xFFFF].value; }
+    bool QuestValue(const uint8_t* player, uint32_t entry, uint32_t addonBase, bool, int32_t& out)
+    {
+        const int i = VisibleItemIndex(player, entry);
+        if (i < 0)
+            return false;
+        out = static_cast<int32_t>(PlayerAddon(static_cast<uint32_t>(i) + addonBase));
+        return true;
+    }
+#endif
 
     int __cdecl Detour5E0420(uint32_t entry, uint32_t b)   // sub_10a44ae0
     {
+        int32_t xp;
         if (const uint8_t* player = ActivePlayer())
-        {
-            const int i = VisibleItemIndex(player, entry);
-            if (i >= 0)
-                return static_cast<int>(PlayerAddon(i + 0x24));
-        }
+            if (QuestValue(player, entry, 0x24, false, xp))
+                return xp;
         return g_5E0420(entry, b);
     }
 
     int __cdecl Detour61E5C0(uint32_t entry, uint32_t b)   // sub_10a4d770: every matching index overrides
     {
         if (const uint8_t* player = ActivePlayer())
+        {
+#if ASCENSION_QUEST_LOG_64
+            b = static_cast<uint32_t>(AscQuestLog64::LinkLevel(Descriptor(player), entry, static_cast<int32_t>(b), &PlayerAddon));
+#else
             for (uint32_t i = 0; i < 0x19; ++i)
             {
                 const uint32_t e = *reinterpret_cast<const uint32_t*>(Descriptor(player) + 0x278 + i * 0x14);
                 if (e != 0 && e == entry)
                     b = PlayerAddon(i + 0x3D);
             }
+#endif
+        }
         return g_61E5C0(entry, b);
     }
 
     int __cdecl Detour5E0D20(uint32_t entry)   // sub_10a790a0
     {
+        int32_t level;
         if (const uint8_t* player = ActivePlayer())
-        {
-            const int i = VisibleItemIndex(player, entry);
-            if (i >= 0)
-                return static_cast<int>(PlayerAddon(i + 0x3D));
-        }
+            if (QuestValue(player, entry, 0x3D, true, level))
+                return level;
         return g_5E0D20(entry);
     }
 

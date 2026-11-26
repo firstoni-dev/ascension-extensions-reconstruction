@@ -1,6 +1,10 @@
 cmake_minimum_required(VERSION 3.25)
 project(AscensionExtensions LANGUAGES C CXX)
 
+if(NOT CMAKE_SIZEOF_VOID_P EQUAL 4)
+    message(FATAL_ERROR "Extensions.dll must be built for x86 (32-bit)")
+endif()
+
 # Our own Extensions.dll for Ascension.exe (stock Wow.exe 12340 + a LoadLibraryA("Extensions.dll")
 # cave), built on the MIT WotLK-Extensions DLL sources vendored under WotLKExtensions/.
 # No Patcher, no injector: the exe loads a DLL of this name by itself.
@@ -53,6 +57,11 @@ option(ASCENSION_HOT_PATCH "Interface hot-patch channel and the 0x5BC formatter 
 # SMSG 0x8F3 / 0x8F4 / 0x8F5: batched server rows for GameObjectDisplayInfo, Map and MapDifficulty, which the
 # original has no patch handler for. OFF by default. See src/Ascension/AscDbcStream.cpp.
 option(ASCENSION_DBC_STREAM "Server-streamed GameObjectDisplayInfo / Map / MapDifficulty rows (not in the original)" OFF)
+
+# --- Quest log of 64 quests (our addition; not in the original) ---------------------------------------
+# SMSG 0x8F7 carries quest log slots 25..63; the DLL announces itself with CMSG 0x8F6 after every world entry.
+# ON by default; OFF gives the genuine 25-slot behaviour. See src/Ascension/AscQuestLog64.cpp.
+option(ASCENSION_QUEST_LOG_64 "Quest log of 64 quests via SMSG 0x8F7 (not in the original)" ON)
 
 set(UP ${CMAKE_CURRENT_SOURCE_DIR}/WotLKExtensions)
 configure_file(${UP}/cmake/PatchConfig.hpp.in ${CMAKE_BINARY_DIR}/gen/PatchConfig.hpp)

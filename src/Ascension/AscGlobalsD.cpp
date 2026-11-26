@@ -2,6 +2,7 @@
 #include <Ascension/AscBindings.hpp>
 #include <Ascension/AscGameEvents.hpp>
 #include <Ascension/AscItemAddon.hpp>
+#include <Ascension/AscQuestLog64.hpp>
 #include <Ascension/AscScript.hpp>
 #include <Ascension/RealmInfo.hpp>
 #include <cstring>
@@ -217,23 +218,30 @@ namespace
         return 1;
     }
 
-    // Quest log (descriptor +0x278, 25 x 0x14): 0x5DEEB0 -> log index, 0x5E0EA0(index - 1, 1).
+    // Quest log (descriptor +0x278, 25 x 0x14; ASCENSION_QUEST_LOG_64: the 64 slots, 25..63 from SMSG 0x8F7):
+    // 0x5DEEB0 -> log index, 0x5E0EA0(index - 1, 1).
     int IsQuestComplete(lua_State* L)
     {
         if (*reinterpret_cast<const uint8_t*>(0xBD0792))
         {
             const int32_t id = ToInt(AscLua::lua_tonumber(L, 1));
             const uint8_t* d = *reinterpret_cast<uint8_t**>(ActivePlayer() + 8);
-            for (uint32_t i = 0; i < 0x19; ++i)
+#if ASCENSION_QUEST_LOG_64
+            bool logged = AscQuestLog64::QuestSlot(d, static_cast<uint32_t>(id)) >= 0;
+#else
+            bool logged = false;
+            for (uint32_t i = 0; i < 0x19 && !logged; ++i)
             {
                 const int32_t q = *reinterpret_cast<const int32_t*>(d + 0x278 + i * 0x14);
-                if (q != 0 && q == id)
-                {
-                    const int idx = reinterpret_cast<int(__cdecl*)(int)>(0x5DEEB0)(id);
-                    const char done = reinterpret_cast<char(__cdecl*)(int, int)>(0x5E0EA0)(idx - 1, 1);
-                    AscLua::lua_pushboolean(L, done != 0);
-                    return 1;
-                }
+                logged = q != 0 && q == id;
+            }
+#endif
+            if (logged)
+            {
+                const int idx = reinterpret_cast<int(__cdecl*)(int)>(0x5DEEB0)(id);
+                const char done = reinterpret_cast<char(__cdecl*)(int, int)>(0x5E0EA0)(idx - 1, 1);
+                AscLua::lua_pushboolean(L, done != 0);
+                return 1;
             }
         }
         AscLua::lua_pushboolean(L, 0);
